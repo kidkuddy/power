@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"time"
 
 	"github.com/slack-go/slack"
 )
@@ -65,8 +66,26 @@ func (a *adapter) onCoworker(ctx context.Context, m coMsg) error {
 		_, _, err := a.post(ctx, out, blocks)
 		return err
 	}
+	if m.user != a.owner {
+		today := time.Now().Format("2006-01-02")
+		if a.st.Day != today {
+			a.st.Day, a.st.Banter = today, map[string]int{}
+		}
+		a.st.Banter[m.user]++
+		if err := a.save(); err != nil {
+			return err
+		}
+		if a.st.Banter[m.user] > banterPerDay { // every one-liner is a Claude call
+			out.Text = "i only answer to the owner, bruh"
+			_, _, err := a.post(ctx, out, nil)
+			return err
+		}
+	}
 	return a.banter(m)
 }
+
+// ponytail: a flat daily cap per coworker; per-hour buckets if 20 proves too blunt.
+const banterPerDay = 20
 
 // banter starts --banter-workflow: Claude with no tools writes POWER's one-liner
 // into the message's thread ("yes senpai" when it is the owner).

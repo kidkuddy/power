@@ -985,10 +985,20 @@ func TestCoworkers(t *testing.T) {
 		t.Fatalf("owner banter = %v", k.started[2])
 	}
 
+	// past the daily cap: a canned line, no Claude; the owner is never capped
+	for i := 0; i < banterPerDay; i++ {
+		must(a.onMessage(ctx, ch("UEVE", fmt.Sprintf("20.%d", i), "spam")))
+	}
+	n := len(k.started)
+	must(a.onMessage(ctx, ch("UEVE", "21.1", "spam")))
+	if p := s.of("chat.postMessage"); len(k.started) != n || p[len(p)-1].Get("text") != "i only answer to the owner, bruh" {
+		t.Fatalf("cap: started %d→%d, last %v", n, len(k.started), p[len(p)-1])
+	}
+
 	// off: a non-owner DM is ignored again
 	a.coworkers = false
 	must(a.onMessage(ctx, reply("UBOB", "", "13.1", "hi")))
-	if len(k.started) != 3 {
+	if len(k.started) != n {
 		t.Fatal("coworker answered with the flag off")
 	}
 }

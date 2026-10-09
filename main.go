@@ -452,10 +452,12 @@ func (a *adapter) kamiCall(method, path string, body, out any) error {
 // --- state ---------------------------------------------------------------------
 
 type state struct {
-	Since   int64               `json:"since"`           // last kami event handled
-	Threads map[string]*thread  `json:"threads"`         // contract id -> its DM
-	Queue   map[string][]queued `json:"queue,omitempty"` // chat thread key -> messages not yet handed to kami
-	Cards   map[string]*card    `json:"cards,omitempty"` // top-level run id -> its status card
+	Since   int64               `json:"since"`            // last kami event handled
+	Threads map[string]*thread  `json:"threads"`          // contract id -> its DM
+	Queue   map[string][]queued `json:"queue,omitempty"`  // chat thread key -> messages not yet handed to kami
+	Cards   map[string]*card    `json:"cards,omitempty"`  // top-level run id -> its status card
+	Day     string              `json:"day,omitempty"`    // the local day Banter counts
+	Banter  map[string]int      `json:"banter,omitempty"` // coworker -> one-liners asked for on Day
 }
 
 type queued struct {
@@ -477,7 +479,7 @@ type thread struct {
 func (a *adapter) statePath() string { return filepath.Join(a.dir, "slack.json") }
 
 func (a *adapter) load() error {
-	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}}
+	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}}
 	raw, err := os.ReadFile(a.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -496,6 +498,9 @@ func (a *adapter) load() error {
 	}
 	if a.st.Cards == nil {
 		a.st.Cards = map[string]*card{}
+	}
+	if a.st.Banter == nil {
+		a.st.Banter = map[string]int{}
 	}
 	return nil
 }
