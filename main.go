@@ -1,0 +1,425 @@
+// Command kami-slack is Kami's Slack surface. `serve` DMs the owner every
+// contract as it opens and resolves it from a button or a thread reply; `dm`
+// and `canvas` are for workflow script steps.
+//
+// It uses niffty's Slack app (tokens and owner id from niffty's .env) and
+// replaces niffty: run one or the other, never both on the same app.
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/slack-go/slack"
+
+	"kami/internal/engine"
+)
+
+const usage = `kami-slack — Kami's Slack surface (niffty's Slack app, owner DMs only)
+
+  kami-slack serve [--poll 5s] [--kekkai K]     contracts → owner DMs; buttons and thread replies resolve them;
+                   [--chat-kekkai work] [--chat-workflow chat]   other owner DMs go to a chat run
+  kami-slack dm [--thread TS] [<text>...]       DM the owner (text on stdin when no args); prints {"channel","ts"}
+  kami-slack canvas [--key <slug>] <title>      markdown on stdin → private canvas shared with the owner; prints its URL
+
+  audit (every message in and out is in $KAMI_HOME/adapters/slack-transcript.ndjson):
+  kami-slack thread <ts> [--json]               a thread of the owner DM, live from Slack, with its contract/run ids
+  kami-slack threads [--since 24h] [--json]     threads in the transcript: root, first line, messages, last activity, runs, contracts
+  kami-slack log [-f] [--run R] [--contract C] [--thread T] [--json]   the transcript, filtered; -f follows
+
+  common flags: --slack-env PATH (default ~/.local/share/niffty/.env)  --kami-sock PATH`
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, usage)
+		os.Exit(2)
+	}
+	cmd, args := os.Args[1], os.Args[2:]
+	h, _ := os.UserHomeDir()
+	fs := flag.NewFlagSet("kami-slack "+cmd, flag.ExitOnError)
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, usage) }
+	envPath := fs.String("slack-env", filepath.Join(h, ".local/share/niffty/.env"), "file holding SLACK_BOT_TOKEN, SLACK_APP_TOKEN, NIFFTY_OWNER_ID")
+	sock := fs.String("kami-sock", kamiSock(), "kami daemon socket")
+	poll := fs.Duration("poll", 5*time.Second, "serve: kami event poll interval")
+	kek := fs.String("kekkai", "", "serve: only contracts from this kekkai")
+	key := fs.String("key", "", "canvas: stable name; the same key edits the same canvas")
+	thread := fs.String("thread", "", "dm: post into this thread (its root message ts); log: only this thread")
+	asJSON := fs.Bool("json", false, "thread, threads, log: JSON output")
+	follow := fs.Bool("f", false, "log: keep printing new entries")
+	run := fs.String("run", "", "log: only entries of this run")
+	contract := fs.String("contract", "", "log: only entries of this contract")
+	since := fs.Duration("since", 24*time.Hour, "threads: active within this long")
+	chatKek := fs.String("chat-kekkai", "work", "serve: kekkai that owns chat runs")
+	chatWf := fs.String("chat-workflow", "chat", "serve: workflow started for a DM; empty disables chat routing")
+	fs.Parse(args)
+	rest := fs.Args()
+	if cmd == "thread" || cmd == "threads" || cmd == "log" { // flags may follow the ts
+		rest = nil
+		for fs.NArg() > 0 {
+			rest = append(rest, fs.Arg(0))
+			fs.Parse(fs.Args()[1:])
+		}
+	}
+	dir := filepath.Join(kamiHome(), "adapters")
+	switch cmd { // transcript only: no Slack credentials needed
+	case "log":
+		err := printLog(context.Background(), os.Stdout, filepath.Join(dir, "slack-transcript.ndjson"),
+			filter{run: *run, contract: *contract, thread: *thread}, *follow, *asJSON)
+		if err != nil {
+			log.Fatalf("kami-slack log: %v", err)
+		}
+		return
+	case "threads":
+		entries, err := readTranscript(filepath.Join(dir, "slack-transcript.ndjson"))
+		if err == nil {
+			err = printThreads(os.Stdout, summarize(entries, time.Now().Add(-*since)), *asJSON)
+		}
+		if err != nil {
+			log.Fatalf("kami-slack threads: %v", err)
+		}
+		return
+	}
+
+	env, err := dotenv(*envPath, "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "NIFFTY_OWNER_ID")
+	if err != nil {
+		log.Fatalf("kami-slack: %v", err)
+	}
+	if env["SLACK_BOT_TOKEN"] == "" || env["NIFFTY_OWNER_ID"] == "" {
+		log.Fatalf("kami-slack: SLACK_BOT_TOKEN and NIFFTY_OWNER_ID must be set in %s", *envPath)
+	}
+	a := &adapter{
+		api:          slack.New(env["SLACK_BOT_TOKEN"], slack.OptionAppLevelToken(env["SLACK_APP_TOKEN"])),
+		kami:         kamiClient(*sock),
+		owner:        env["NIFFTY_OWNER_ID"],
+		kekkai:       *kek,
+		chatKekkai:   *chatKek,
+		chatWorkflow: *chatWf,
+		dir:          dir,
+	}
+	if cmd != "serve" {
+		a.run = os.Getenv("KAMI_RUN") // set for a workflow script step
+	}
+	ctx := context.Background()
+	switch cmd {
+	case "serve":
+		if env["SLACK_APP_TOKEN"] == "" {
+			log.Fatalf("kami-slack: SLACK_APP_TOKEN must be set in %s for serve", *envPath)
+		}
+		err = a.serve(ctx, *poll)
+	case "dm":
+		text := strings.Join(fs.Args(), " ")
+		if text == "" {
+			raw, _ := io.ReadAll(os.Stdin)
+			text = string(raw)
+		}
+		if strings.TrimSpace(text) == "" {
+			log.Fatal("kami-slack dm: no text")
+		}
+		kind := "dm"
+		if *thread != "" {
+			kind = "thread_reply"
+		}
+		var ch, ts string
+		if ch, ts, err = a.post(ctx, entry{Kind: kind, ThreadTS: *thread, Text: strings.TrimSpace(text)}, nil); err == nil {
+			json.NewEncoder(os.Stdout).Encode(map[string]string{"channel": ch, "ts": ts})
+		}
+	case "canvas":
+		title := strings.Join(fs.Args(), " ")
+		if title == "" {
+			log.Fatal("kami-slack canvas: a title is required")
+		}
+		raw, _ := io.ReadAll(os.Stdin)
+		var u string
+		if u, err = a.canvas(ctx, *key, title, string(raw)); err == nil {
+			fmt.Println(u)
+		}
+	case "thread":
+		if len(rest) != 1 {
+			log.Fatal("kami-slack thread: one thread ts is required")
+		}
+		err = a.printThread(ctx, os.Stdout, rest[0], *asJSON)
+	default:
+		fmt.Fprintln(os.Stderr, usage)
+		os.Exit(2)
+	}
+	if err != nil {
+		log.Fatalf("kami-slack %s: %v", cmd, err)
+	}
+}
+
+func kamiHome() string {
+	if h := os.Getenv("KAMI_HOME"); h != "" {
+		return h
+	}
+	h, _ := os.UserHomeDir()
+	return filepath.Join(h, ".kami")
+}
+
+func kamiSock() string {
+	if s := os.Getenv("KAMI_SOCK"); s != "" {
+		return s
+	}
+	return filepath.Join(kamiHome(), "kami.sock")
+}
+
+// dotenv reads only the named keys from a KEY=value file. The values are
+// secrets: they are never logged or printed.
+func dotenv(path string, keys ...string) (map[string]string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		k = strings.TrimSpace(k)
+		if ok && contains(keys, k) {
+			out[k] = strings.Trim(strings.TrimSpace(v), `"'`)
+		}
+	}
+	return out, nil
+}
+
+func kamiClient(sock string) *http.Client {
+	return &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", sock)
+		}}}
+}
+
+type adapter struct {
+	api    *slack.Client
+	kami   *http.Client
+	owner  string
+	kekkai string
+	dir    string // $KAMI_HOME/adapters
+
+	chatKekkai, chatWorkflow string
+	im                       string // the owner's DM channel, opened once
+	st                       state
+	run                      string          // $KAMI_RUN of a script step's dm/canvas, for the transcript
+	links                    map[string]link // run id -> its thread, once known
+}
+
+// --- Slack ---------------------------------------------------------------------
+
+// post sends e.Text to the owner's DM, threaded under e.ThreadTS when set,
+// and records e in the transcript (as kind error when the post fails). Blocks
+// are optional; text is always sent as the notification fallback.
+func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (string, string, error) {
+	e.Dir = "out"
+	im, err := a.dm(ctx)
+	if err == nil {
+		opts := []slack.MsgOption{slack.MsgOptionText(e.Text, false)}
+		if blocks != nil {
+			opts = append(opts, slack.MsgOptionBlocks(blocks...))
+		}
+		if e.ThreadTS != "" {
+			opts = append(opts, slack.MsgOptionTS(e.ThreadTS))
+		}
+		if e.Channel, e.TS, err = a.api.PostMessageContext(ctx, im, opts...); err != nil {
+			err = fmt.Errorf("post message: %w", err)
+		}
+	}
+	if err != nil {
+		e.Kind, e.Error = "error", strings.TrimPrefix(e.Error+"; ", "; ")+err.Error()
+		a.record(e)
+		return "", "", err
+	}
+	a.record(e)
+	return e.Channel, e.TS, nil
+}
+
+// dm returns the owner's DM channel, opening it on first use.
+func (a *adapter) dm(ctx context.Context) (string, error) {
+	if a.im == "" {
+		ch, _, _, err := a.api.OpenConversationContext(ctx, &slack.OpenConversationParameters{Users: []string{a.owner}})
+		if err != nil {
+			return "", fmt.Errorf("open DM with owner: %w", err)
+		}
+		a.im = ch.ID
+	}
+	return a.im, nil
+}
+
+var slug = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+// canvas creates a canvas only the bot and the owner can see, or with a key
+// edits the canvas that key made before; it returns the permalink.
+// A key's canvas id lives in its own file, so parallel script steps never race.
+func (a *adapter) canvas(ctx context.Context, key, title, markdown string) (string, error) {
+	u, err := a.writeCanvas(ctx, key, title, markdown)
+	e := entry{Dir: "out", Kind: "canvas", Text: markdown, Title: title, CanvasURL: u}
+	if err != nil {
+		e.Kind, e.Error = "error", err.Error()
+	}
+	a.record(e)
+	return u, err
+}
+
+func (a *adapter) writeCanvas(ctx context.Context, key, title, markdown string) (string, error) {
+	doc := slack.DocumentContent{Type: "markdown", Markdown: markdown}
+	var keyFile string
+	if key != "" {
+		if !slug.MatchString(key) {
+			return "", fmt.Errorf("--key %q: use letters, digits, '.', '_' or '-'", key)
+		}
+		keyFile = filepath.Join(a.dir, "slack-canvas", key)
+		if raw, err := os.ReadFile(keyFile); err == nil {
+			id := strings.TrimSpace(string(raw))
+			err := a.api.EditCanvasContext(ctx, slack.EditCanvasParams{CanvasID: id,
+				Changes: []slack.CanvasChange{{Operation: "replace", DocumentContent: doc}}})
+			if err == nil {
+				return a.permalink(ctx, id)
+			}
+			log.Printf("kami-slack: canvas %s for key %s unreachable (%v); making a new one", id, key, err)
+		}
+	}
+	id, err := a.api.CreateCanvasContext(ctx, title, doc)
+	if err != nil {
+		return "", fmt.Errorf("create canvas: %w", err)
+	}
+	// Without access the owner's permalink 404s; no channel is ever granted.
+	if err := a.api.SetCanvasAccessContext(ctx, slack.SetCanvasAccessParams{CanvasID: id, AccessLevel: "write", UserIDs: []string{a.owner}}); err != nil {
+		return "", fmt.Errorf("grant canvas access: %w", err)
+	}
+	if keyFile != "" {
+		if err := writeAtomic(keyFile, []byte(id+"\n")); err != nil {
+			return "", err
+		}
+	}
+	return a.permalink(ctx, id)
+}
+
+func (a *adapter) permalink(ctx context.Context, id string) (string, error) {
+	f, _, _, err := a.api.GetFileInfoContext(ctx, id, 0, 0)
+	if err != nil {
+		return "", fmt.Errorf("permalink for %s: %w", id, err)
+	}
+	return f.Permalink, nil
+}
+
+// --- Kami ----------------------------------------------------------------------
+
+// kamiErr is a refusal from the daemon (bad answer, conflict), shown to the user.
+type kamiErr struct{ engine.APIError }
+
+func (e *kamiErr) Error() string { return e.Code + ": " + e.Message }
+
+func (a *adapter) kamiCall(method, path string, body, out any) error {
+	var rd io.Reader
+	if body != nil {
+		raw, _ := json.Marshal(body)
+		rd = bytes.NewReader(raw)
+	}
+	req, _ := http.NewRequest(method, "http://kami"+path, rd)
+	resp, err := a.kami.Do(req) // never X-Kami-Token: that marks a worker, which may not resolve
+	if err != nil {
+		return fmt.Errorf("kami: %v", err)
+	}
+	defer resp.Body.Close()
+	var env engine.Envelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return fmt.Errorf("kami %s %s: %v", method, path, err)
+	}
+	if !env.OK {
+		if env.Error == nil {
+			return fmt.Errorf("kami %s %s: HTTP %d", method, path, resp.StatusCode)
+		}
+		if env.Error.Code == "INTERNAL" || env.Error.Code == "UNAVAILABLE" {
+			return fmt.Errorf("kami %s %s: %s", method, path, env.Error.Message)
+		}
+		return &kamiErr{*env.Error}
+	}
+	if out != nil {
+		return json.Unmarshal(env.Data, out)
+	}
+	return nil
+}
+
+// --- state ---------------------------------------------------------------------
+
+type state struct {
+	Since   int64               `json:"since"`           // last kami event handled
+	Threads map[string]*thread  `json:"threads"`         // contract id -> its DM
+	Queue   map[string][]queued `json:"queue,omitempty"` // chat thread key -> messages not yet handed to kami
+}
+
+type queued struct {
+	Text string `json:"text"`
+	TS   string `json:"ts"`
+}
+
+type thread struct {
+	TS      string `json:"ts"`               // the contract message's ts
+	Thread  string `json:"thread,omitempty"` // its run's thread when it was posted into one; else replies thread under TS
+	Text    string `json:"text"`             // what was posted, to redraw it without buttons
+	Buttons bool   `json:"buttons"`          // answered by button
+	Mine    bool   `json:"mine,omitempty"`   // resolved from Slack: no follow-up for contract.resolved
+
+	RunID    string `json:"run_id,omitempty"` // for the transcript
+	Workflow string `json:"workflow,omitempty"`
+}
+
+func (a *adapter) statePath() string { return filepath.Join(a.dir, "slack.json") }
+
+func (a *adapter) load() error {
+	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}}
+	raw, err := os.ReadFile(a.statePath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw, &a.st); err != nil {
+		return fmt.Errorf("%s: %v", a.statePath(), err)
+	}
+	if a.st.Threads == nil {
+		a.st.Threads = map[string]*thread{}
+	}
+	if a.st.Queue == nil {
+		a.st.Queue = map[string][]queued{}
+	}
+	return nil
+}
+
+func (a *adapter) save() error {
+	raw, _ := json.MarshalIndent(a.st, "", "  ")
+	return writeAtomic(a.statePath(), raw)
+}
+
+// writeAtomic writes then renames, so a crash never leaves half a file.
+func writeAtomic(path string, raw []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func contains(l []string, s string) bool {
+	for _, x := range l {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
