@@ -55,7 +55,7 @@ func (a *adapter) record(e entry) {
 		e.RunID = a.run
 	}
 	raw, _ := json.Marshal(e)
-	err := os.MkdirAll(a.dir, 0o755)
+	err := os.MkdirAll(a.dir, 0o700)
 	if err == nil {
 		var f *os.File
 		if f, err = os.OpenFile(a.transcriptPath(), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600); err == nil {
