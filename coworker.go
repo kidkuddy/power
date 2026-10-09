@@ -182,7 +182,7 @@ func (a *adapter) addressed(ctx context.Context, m coMsg) bool {
 		return true
 	}
 	var runs []struct{}
-	v := url.Values{"status": {"active"}, "kekkai": {a.chatKekkai}, "var": {"key=" + key}}
+	v := url.Values{"status": {"active"}, "kekkai": {a.chatKekkai}, "var": {"kami_key=" + key}}
 	if err := a.kamiCall("GET", "/runs?"+v.Encode(), nil, &runs); err != nil {
 		a.logErr(err)
 		return false

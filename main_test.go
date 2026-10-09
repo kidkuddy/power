@@ -84,12 +84,12 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		if ok && q.Get("status") == "active" && q.Get("kekkai") == "work" && k.busy[key] {
 			runs = append(runs, map[string]any{"id": "run-" + key, "workflow": "chat", "status": "running"})
 		}
-		if ck, isConv := strings.CutPrefix(q.Get("var"), "key="); isConv && q.Get("status") == "active" && k.busy[ck] {
+		if ck, isConv := strings.CutPrefix(q.Get("var"), "kami_key="); isConv && q.Get("status") == "active" && k.busy[ck] {
 			runs = append(runs, map[string]any{"id": "run-" + ck, "workflow": "converse", "status": "running"})
 		}
-		if ok && q.Get("status") == "" {
+		if name, val, isVar := strings.Cut(q.Get("var"), "="); isVar && q.Get("status") == "" {
 			for id, run := range k.runs {
-				if vars, _ := run["vars"].(map[string]any); vars["thread_ts"] == key {
+				if vars, _ := run["vars"].(map[string]any); vars[name] == val {
 					runs = append(runs, map[string]any{"id": id, "workflow": run["workflow"]})
 				}
 			}
@@ -425,7 +425,7 @@ func TestChat(t *testing.T) {
 	}
 
 	// an earlier chat in this thread went to sleep: the new run resumes its session
-	k.runs["06old"] = map[string]any{"workflow": "chat", "vars": map[string]any{"thread_ts": "300.1"}, "sessions": map[string]any{"think": "claude:s-old"}}
+	k.runs["06old"] = map[string]any{"workflow": "chat", "vars": map[string]any{"thread_ts": "300.1", "kami_thread": "300.1"}, "sessions": map[string]any{"think": "claude:s-old"}}
 	// top-level DM: 👀, signal (nobody waiting), no run owns it → a run starts under the message itself
 	must(a.onMessage(ctx, reply(owner, "", "300.1", "deploy &lt;staging&gt;")))
 	if ss, _ := inputs(0)["kami_sessions"].(map[string]any); ss["think"] != "claude:s-old" {
@@ -1004,14 +1004,14 @@ func TestCoworkers(t *testing.T) {
 	// anything else goes to its conversation's session: a DM with a coworker…
 	must(a.onMessage(ctx, reply("UBOB", "", "11.1", "hi")))
 	in := k.started[1]["inputs"].(map[string]any)
-	if k.started[1]["workflow"] != "converse" || in["kami_conv"] != "dm" || in["kami_peer"] != "UBOB" || in["key"] != "dm:D1" ||
+	if k.started[1]["workflow"] != "converse" || in["kami_conv"] != "dm" || in["kami_peer"] != "UBOB" || in["kami_key"] != "dm:D1" ||
 		in["kami_reply_ts"] != "" || in["owner_msg"] != false || in["from_name"] != "name-UBOB" || !strings.Contains(in["place"].(string), "DM") {
 		t.Fatalf("dm session = %v", k.started[1])
 	}
 	// …a channel's main conversation (the owner, here)…
 	must(a.onMessage(ctx, ch(owner, "12.1", "<@UPOWER> you there?")))
 	in = k.started[2]["inputs"].(map[string]any)
-	if in["kami_conv"] != "group" || in["key"] != "chan:C1" || in["owner_msg"] != true || in["kami_peer"] != nil || in["text"] != "<@UPOWER> you there?" {
+	if in["kami_conv"] != "group" || in["kami_key"] != "chan:C1" || in["owner_msg"] != true || in["kami_peer"] != nil || in["text"] != "<@UPOWER> you there?" {
 		t.Fatalf("channel session = %v", k.started[2])
 	}
 	// …and a channel thread, which carries the thread so far with names
@@ -1019,7 +1019,7 @@ func TestCoworkers(t *testing.T) {
 		{"ts": "30.2", "bot_id": "B1", "text": "never"}, {"ts": "30.3", "user": owner, "text": "<@UPOWER> be nice"}}
 	must(a.onCoworker(ctx, coMsg{owner, "<@UPOWER> be nice", "C1", "30.3", "30.1", "channel"}))
 	in = k.started[3]["inputs"].(map[string]any)
-	if in["key"] != "thr:C1:30.1" || in["kami_reply_ts"] != "30.1" || in["history"] != "name-UBOB: ship it?\nPOWER (you): never" {
+	if in["kami_key"] != "thr:C1:30.1" || in["kami_reply_ts"] != "30.1" || in["history"] != "name-UBOB: ship it?\nPOWER (you): never" {
 		t.Fatalf("thread session = %v", in)
 	}
 	// a waiting session gets the next message as a signal; a busy one queues it, then one labeled turn

@@ -105,7 +105,7 @@ func (a *adapter) routeConv(ctx context.Context, key string, m coMsg) error {
 	var runs []struct {
 		Workflow string `json:"workflow"`
 	}
-	v := url.Values{"status": {"active"}, "kekkai": {a.chatKekkai}, "var": {"key=" + key}}
+	v := url.Values{"status": {"active"}, "kekkai": {a.chatKekkai}, "var": {"kami_key=" + key}}
 	if err := a.kamiCall("GET", "/runs?"+v.Encode(), nil, &runs); err != nil {
 		return err
 	}
@@ -115,8 +115,9 @@ func (a *adapter) routeConv(ctx context.Context, key string, m coMsg) error {
 		}
 	}
 	// kami_*: where this session speaks and what it may remember; inputs only, nothing can change them later
-	in := map[string]any{"kami_conv": kind, "kami_channel": m.channel, "kami_reply_ts": reply, "key": key, "place": place,
-		"history": a.convHistory(ctx, m, q), "kami_sessions": a.lastSessions(a.convWorkflow, "key", key)}
+	// kami_key: what it listens on and which session it resumes; like every kami_* input, nothing can change it later
+	in := map[string]any{"kami_conv": kind, "kami_channel": m.channel, "kami_reply_ts": reply, "kami_key": key, "place": place,
+		"history": a.convHistory(ctx, m, q), "kami_sessions": a.lastSessions(a.convWorkflow, "kami_key", key)}
 	if kind == "dm" {
 		in["kami_peer"] = m.user
 	}

@@ -618,7 +618,8 @@ func (a *adapter) route(ctx context.Context, key string) error {
 	}
 	err = a.kamiCall("POST", "/runs", map[string]any{"kekkai": a.chatKekkai, "workflow": a.chatWorkflow,
 		"inputs": map[string]any{"thread_ts": key, "channel": im, "text": strings.Join(texts, "\n\n"), "history": history, "thread_runs": tied,
-			"thread_contracts": a.threadContracts(key), "kami_conv": "owner", "kami_sessions": a.lastSessions(a.chatWorkflow, "thread_ts", key)}}, &run)
+			"thread_contracts": a.threadContracts(key), "kami_conv": "owner", "kami_thread": key,
+			"kami_sessions": a.lastSessions(a.chatWorkflow, "kami_thread", key)}}, &run)
 	var ke *kamiErr
 	if err != nil && !errors.As(err, &ke) {
 		return err // kami unreachable: keep the queue, retry next tick
@@ -642,6 +643,7 @@ func (a *adapter) route(ctx context.Context, key string) error {
 
 // lastSessions is the Claude sessions of the newest earlier run of workflow
 // tied to var=val: a chat that went to sleep wakes up in the same session.
+// var is always a kami_* input, which no worker can change.
 func (a *adapter) lastSessions(workflow, key, val string) map[string]any {
 	var runs []struct {
 		ID       string `json:"id"`
