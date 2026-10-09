@@ -424,8 +424,14 @@ func TestChat(t *testing.T) {
 		t.Fatal("non-owner DM routed")
 	}
 
+	// an earlier chat in this thread went to sleep: the new run resumes its session
+	k.runs["06old"] = map[string]any{"workflow": "chat", "vars": map[string]any{"thread_ts": "300.1"}, "sessions": map[string]any{"think": "claude:s-old"}}
 	// top-level DM: 👀, signal (nobody waiting), no run owns it → a run starts under the message itself
 	must(a.onMessage(ctx, reply(owner, "", "300.1", "deploy &lt;staging&gt;")))
+	if ss, _ := inputs(0)["kami_sessions"].(map[string]any); ss["think"] != "claude:s-old" {
+		t.Fatalf("kami_sessions = %v", inputs(0)["kami_sessions"])
+	}
+	delete(k.runs, "06old")
 	if r := s.of("reactions.add"); len(r) != 1 || r[0].Get("name") != "eyes" || r[0].Get("timestamp") != "300.1" || r[0].Get("channel") != "D1" {
 		t.Fatalf("reaction = %v", r)
 	}

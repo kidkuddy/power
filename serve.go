@@ -618,7 +618,7 @@ func (a *adapter) route(ctx context.Context, key string) error {
 	}
 	err = a.kamiCall("POST", "/runs", map[string]any{"kekkai": a.chatKekkai, "workflow": a.chatWorkflow,
 		"inputs": map[string]any{"thread_ts": key, "channel": im, "text": strings.Join(texts, "\n\n"), "history": history, "thread_runs": tied,
-			"thread_contracts": a.threadContracts(key), "kami_conv": "owner"}}, &run)
+			"thread_contracts": a.threadContracts(key), "kami_conv": "owner", "kami_sessions": a.lastSessions(a.chatWorkflow, "thread_ts", key)}}, &run)
 	var ke *kamiErr
 	if err != nil && !errors.As(err, &ke) {
 		return err // kami unreachable: keep the queue, retry next tick
@@ -638,6 +638,36 @@ func (a *adapter) route(ctx context.Context, key string) error {
 		return err
 	}
 	return nil
+}
+
+// lastSessions is the Claude sessions of the newest earlier run of workflow
+// tied to var=val: a chat that went to sleep wakes up in the same session.
+func (a *adapter) lastSessions(workflow, key, val string) map[string]any {
+	var runs []struct {
+		ID       string `json:"id"`
+		Workflow string `json:"workflow"`
+	}
+	if err := a.kamiCall("GET", "/runs?"+url.Values{"kekkai": {a.chatKekkai}, "var": {key + "=" + val}}.Encode(), nil, &runs); err != nil {
+		a.logErr(err)
+		return nil
+	}
+	newest := ""
+	for _, r := range runs {
+		if r.Workflow == workflow && r.ID > newest { // ids sort by time
+			newest = r.ID
+		}
+	}
+	if newest == "" {
+		return nil
+	}
+	var run struct {
+		Sessions map[string]any `json:"sessions"`
+	}
+	if err := a.kamiCall("GET", "/runs/"+url.PathEscape(newest), nil, &run); err != nil {
+		a.logErr(err)
+		return nil
+	}
+	return run.Sessions
 }
 
 // threadContracts is the ids of the open contracts posted in a thread, or as its root.

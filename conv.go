@@ -116,7 +116,7 @@ func (a *adapter) routeConv(ctx context.Context, key string, m coMsg) error {
 	}
 	// kami_*: where this session speaks and what it may remember; inputs only, nothing can change them later
 	in := map[string]any{"kami_conv": kind, "kami_channel": m.channel, "kami_reply_ts": reply, "key": key, "place": place,
-		"history": a.convHistory(ctx, m, q)}
+		"history": a.convHistory(ctx, m, q), "kami_sessions": a.lastSessions(a.convWorkflow, "key", key)}
 	if kind == "dm" {
 		in["kami_peer"] = m.user
 	}
