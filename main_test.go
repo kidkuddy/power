@@ -796,8 +796,8 @@ func TestRunThreads(t *testing.T) {
 		strings.Count(card.Get("text"), "↳") != 1 {
 		t.Fatalf("card = %v", card)
 	}
-	if p := s.of("pins.add"); len(p) != 1 || p[0].Get("timestamp") != "100.3" {
-		t.Fatalf("pins = %v", p)
+	if p := s.of("pins.add"); len(p) != 0 {
+		t.Fatalf("cards are not pinned: %v", p)
 	}
 	if th := a.st.Threads; th["c1"].Thread != "700.1" || th["c1"].TS != "100.1" || th["cN"].Thread != "" || th["c5"].Thread != "800.1" {
 		t.Fatalf("threads = %+v %+v %+v", th["c1"], th["cN"], th["c5"])

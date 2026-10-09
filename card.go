@@ -12,7 +12,7 @@ import (
 )
 
 // A status card is one message per top-level run (a goal), the first reply in
-// its thread, pinned and edited in place: one line per milestone, one line per
+// its thread, edited in place: one line per milestone, one line per
 // child run that follows the child's latest milestone. Decisions, problems
 // and the run's result still post as their own messages.
 type card struct {
@@ -83,7 +83,6 @@ func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev event
 			return err
 		}
 		c.TS = ts
-		a.logErr(a.pin(ctx, "", ts, true))
 	} else {
 		im, err := a.dm(ctx)
 		if err == nil {
