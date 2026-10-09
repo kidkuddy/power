@@ -984,11 +984,16 @@ func TestCoworkers(t *testing.T) {
 	if p := s.of("chat.postMessage"); len(p) != 2 || p[1].Get("text") != "no :)" || p[1].Get("thread_ts") != "12.1" {
 		t.Fatalf("posts = %v", p)
 	}
+	must(a.onMessage(ctx, ch("UBOB", "12.2", "please")))
+	must(a.onMessage(ctx, ch("UBOB", "12.3", "pretty please")))
+	if p := s.of("chat.postMessage"); len(p) != 4 || p[2].Get("text") != "no :)" || p[3].Get("text") != "i only answer to the owner, bruh" {
+		t.Fatalf("posts = %v", p)
+	}
 
 	// off: a non-owner DM is ignored again, the owner's DM still goes to chat
 	a.coworkers = false
 	must(a.onMessage(ctx, reply("UBOB", "", "13.1", "hi")))
-	if len(s.of("chat.postMessage")) != 2 || len(s.of("files.completeUploadExternal")) != 1 {
+	if len(s.of("chat.postMessage")) != 4 || len(s.of("files.completeUploadExternal")) != 1 {
 		t.Fatal("coworker answered with the flag off")
 	}
 }

@@ -455,6 +455,7 @@ type state struct {
 	Threads map[string]*thread  `json:"threads"`         // contract id -> its DM
 	Queue   map[string][]queued `json:"queue,omitempty"` // chat thread key -> messages not yet handed to kami
 	Seen    map[string]string   `json:"seen,omitempty"`  // coworker user -> local day POWER last sent her picture
+	Count   map[string]int      `json:"count,omitempty"` // coworker user -> messages that day (other than MR links)
 	Cards   map[string]*card    `json:"cards,omitempty"` // top-level run id -> its status card
 }
 
@@ -477,7 +478,7 @@ type thread struct {
 func (a *adapter) statePath() string { return filepath.Join(a.dir, "slack.json") }
 
 func (a *adapter) load() error {
-	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Seen: map[string]string{}, Cards: map[string]*card{}}
+	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Seen: map[string]string{}, Count: map[string]int{}, Cards: map[string]*card{}}
 	raw, err := os.ReadFile(a.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -496,6 +497,9 @@ func (a *adapter) load() error {
 	}
 	if a.st.Seen == nil {
 		a.st.Seen = map[string]string{}
+	}
+	if a.st.Count == nil {
+		a.st.Count = map[string]int{}
 	}
 	if a.st.Cards == nil {
 		a.st.Cards = map[string]*card{}

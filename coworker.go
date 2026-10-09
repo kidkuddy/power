@@ -15,8 +15,8 @@ import (
 
 // Coworkers: anyone but the owner in a DM, and anyone at all in a channel.
 // A GitLab MR link gets review / just-approve buttons; the tapper's choice
-// starts --mr-workflow. Anything else gets the picture once a day per
-// person, then "no :)".
+// starts --mr-workflow. Anything else, per person per day: the picture,
+// "no :)" twice, then "i only answer to the owner, bruh".
 
 // Only gitlab.com, the host glab acts on: a link to any other host must not
 // become an approval of the same path on gitlab.com. Same pattern as mr-open's MR_URL.
@@ -70,16 +70,23 @@ func (a *adapter) onCoworker(ctx context.Context, m coMsg) error {
 		return err
 	}
 	today := time.Now().Format("2006-01-02")
-	if a.st.Seen[m.user] == today {
-		out.Text = "no :)"
-		_, _, err := a.post(ctx, out, nil)
+	if a.st.Seen[m.user] != today {
+		if err := a.sendPicture(ctx, m.channel, root); err != nil {
+			return err
+		}
+		a.st.Seen[m.user], a.st.Count[m.user] = today, 1
+		return a.save()
+	}
+	a.st.Count[m.user]++
+	out.Text = "no :)"
+	if a.st.Count[m.user] > 3 { // the picture, then two "no :)"
+		out.Text = "i only answer to the owner, bruh"
+	}
+	if err := a.save(); err != nil {
 		return err
 	}
-	if err := a.sendPicture(ctx, m.channel, root); err != nil {
-		return err
-	}
-	a.st.Seen[m.user] = today
-	return a.save()
+	_, _, err := a.post(ctx, out, nil)
+	return err
 }
 
 func (a *adapter) sendPicture(ctx context.Context, channel, thread string) error {
