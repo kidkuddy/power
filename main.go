@@ -40,6 +40,7 @@ const usage = `kami-slack — Kami's Slack surface (niffty's Slack app)
                                                 (refuses 🔒 contracts: those take a button press)
   kami-slack react [--channel C] <ts> <emoji>    add an emoji reaction (owner DM by default)
   kami-slack upload [--channel C] [--thread TS] <file>   post an image or file
+  kami-slack directory                          {"owner", "owner_im", "users": {id: name}} for scripts
   kami-slack pin [--off] [--channel C] <ts>     pin (or unpin) a message, the owner DM by default
   kami-slack wrap <thread ts>                    unpin a chat thread and the status cards in it
   kami-slack canvas [--key <slug>] [--users U1,U2] <title>   markdown on stdin → private canvas shared with the owner (and users); prints its URL
@@ -193,6 +194,8 @@ func main() {
 			log.Fatal("kami-slack upload: one file is required")
 		}
 		err = a.upload(ctx, *channel, *thread, fs.Arg(0))
+	case "directory":
+		err = a.directory(ctx, os.Stdout)
 	case "pin":
 		if fs.NArg() != 1 {
 			log.Fatal("kami-slack pin: one message ts is required")
@@ -304,6 +307,28 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 	}
 	a.record(e)
 	return e.Channel, e.TS, nil
+}
+
+// directory prints the owner, the owner's DM channel and every person's
+// display name, so scripts can tell her chats with the owner from the rest.
+func (a *adapter) directory(ctx context.Context, w io.Writer) error {
+	im, err := a.dm(ctx)
+	if err != nil {
+		return err
+	}
+	users, err := a.api.GetUsersContext(ctx)
+	if err != nil {
+		return fmt.Errorf("users.list: %w", err)
+	}
+	names := map[string]string{}
+	for _, u := range users {
+		n := u.Profile.DisplayName
+		if n == "" {
+			n = u.RealName
+		}
+		names[u.ID] = n
+	}
+	return json.NewEncoder(w).Encode(map[string]any{"owner": a.owner, "owner_im": im, "users": names})
 }
 
 // react adds an emoji reaction; already reacted counts as done.
