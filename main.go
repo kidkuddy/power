@@ -17,6 +17,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,12 +29,18 @@ import (
 	"kami/internal/engine"
 )
 
-const usage = `kami-slack — Kami's Slack surface (niffty's Slack app, owner DMs only)
+const usage = `kami-slack — Kami's Slack surface (niffty's Slack app)
 
   kami-slack serve [--poll 5s] [--kekkai K]     contracts → owner DMs; buttons and thread replies resolve them;
                    [--chat-kekkai work] [--chat-workflow chat]   other owner DMs go to a chat run
-  kami-slack dm [--thread TS] [<text>...]       DM the owner (text on stdin when no args); prints {"channel","ts"}
-  kami-slack canvas [--key <slug>] <title>      markdown on stdin → private canvas shared with the owner; prints its URL
+                   [--coworkers=true] [--mr-workflow mr] [--picture PATH]   anyone else: an MR link gets
+                                                review/approve buttons, anything else the picture (daily), then "no :)"
+  kami-slack dm [--channel C] [--thread TS] [<text>...]   DM the owner, or post to C (text on stdin when no args); prints {"channel","ts"}
+  kami-slack answer [--data JSON] <contract> <answer...>   answer a contract as the owner, from POWER's chat
+                                                (refuses 🔒 contracts: those take a button press)
+  kami-slack pin [--off] [--channel C] <ts>     pin (or unpin) a message, the owner DM by default
+  kami-slack wrap <thread ts>                    unpin a chat thread and the status cards in it
+  kami-slack canvas [--key <slug>] [--users U1,U2] <title>   markdown on stdin → private canvas shared with the owner (and users); prints its URL
 
   audit (every message in and out is in $KAMI_HOME/adapters/slack-transcript.ndjson):
   kami-slack thread <ts> [--json]               a thread of the owner DM, live from Slack, with its contract/run ids
@@ -56,6 +63,9 @@ func main() {
 	poll := fs.Duration("poll", 5*time.Second, "serve: kami event poll interval")
 	kek := fs.String("kekkai", "", "serve: only contracts from this kekkai")
 	key := fs.String("key", "", "canvas: stable name; the same key edits the same canvas")
+	off := fs.Bool("off", false, "pin: unpin instead")
+	data := fs.String("data", "", "answer: form fields as a JSON object")
+	channel := fs.String("channel", "", "dm: post to this channel instead of the owner DM")
 	thread := fs.String("thread", "", "dm: post into this thread (its root message ts); log: only this thread")
 	asJSON := fs.Bool("json", false, "thread, threads, log: JSON output")
 	follow := fs.Bool("f", false, "log: keep printing new entries")
@@ -64,6 +74,11 @@ func main() {
 	since := fs.Duration("since", 24*time.Hour, "threads: active within this long")
 	chatKek := fs.String("chat-kekkai", "work", "serve: kekkai that owns chat runs")
 	chatWf := fs.String("chat-workflow", "chat", "serve: workflow started for a DM; empty disables chat routing")
+	replyAnswers := fs.Bool("reply-answers", false, "serve: a thread reply answers its open contract directly instead of going to chat")
+	coworkers := fs.Bool("coworkers", true, "serve: answer other people (DMs, mentions, channels POWER is in)")
+	mrWf := fs.String("mr-workflow", "mr", "serve: workflow (in --chat-kekkai) a coworker's review/approve tap starts")
+	picture := fs.String("picture", filepath.Join(kamiHome(), "adapters", "power.gif"), "serve: image sent to coworkers once a day")
+	canvasUsers := fs.String("users", "", "canvas: extra Slack user ids (comma-separated) who may open it")
 	fs.Parse(args)
 	rest := fs.Args()
 	if cmd == "thread" || cmd == "threads" || cmd == "log" { // flags may follow the ts
@@ -107,6 +122,10 @@ func main() {
 		kekkai:       *kek,
 		chatKekkai:   *chatKek,
 		chatWorkflow: *chatWf,
+		coworkers:    *coworkers,
+		replyAnswers: *replyAnswers,
+		mrWorkflow:   *mrWf,
+		picture:      *picture,
 		dir:          dir,
 	}
 	if cmd != "serve" {
@@ -133,7 +152,7 @@ func main() {
 			kind = "thread_reply"
 		}
 		var ch, ts string
-		if ch, ts, err = a.post(ctx, entry{Kind: kind, ThreadTS: *thread, Text: strings.TrimSpace(text)}, nil); err == nil {
+		if ch, ts, err = a.post(ctx, entry{Kind: kind, Channel: *channel, ThreadTS: *thread, Text: strings.TrimSpace(text)}, nil); err == nil {
 			json.NewEncoder(os.Stdout).Encode(map[string]string{"channel": ch, "ts": ts})
 		}
 	case "canvas":
@@ -143,9 +162,30 @@ func main() {
 		}
 		raw, _ := io.ReadAll(os.Stdin)
 		var u string
-		if u, err = a.canvas(ctx, *key, title, string(raw)); err == nil {
+		if u, err = a.canvas(ctx, *key, title, string(raw), splitIDs(*canvasUsers)); err == nil {
 			fmt.Println(u)
 		}
+	case "answer":
+		if fs.NArg() < 2 {
+			log.Fatal("kami-slack answer: a contract id and an answer are required")
+		}
+		var d map[string]any
+		if *data != "" {
+			if err := json.Unmarshal([]byte(*data), &d); err != nil {
+				log.Fatalf("kami-slack answer: --data: %v", err)
+			}
+		}
+		err = a.answer(fs.Arg(0), strings.Join(fs.Args()[1:], " "), d)
+	case "wrap":
+		if fs.NArg() != 1 {
+			log.Fatal("kami-slack wrap: one thread ts is required")
+		}
+		err = a.wrap(ctx, fs.Arg(0))
+	case "pin":
+		if fs.NArg() != 1 {
+			log.Fatal("kami-slack pin: one message ts is required")
+		}
+		err = a.pin(ctx, *channel, fs.Arg(0), !*off)
 	case "thread":
 		if len(rest) != 1 {
 			log.Fatal("kami-slack thread: one thread ts is required")
@@ -209,7 +249,11 @@ type adapter struct {
 	dir    string // $KAMI_HOME/adapters
 
 	chatKekkai, chatWorkflow string
-	im                       string // the owner's DM channel, opened once
+	coworkers                bool            // answer people other than the owner (feature flag)
+	replyAnswers             bool            // a thread reply answers its open contract; off: it goes to chat
+	mrWorkflow, picture      string          // started on a coworker's review/approve tap; sent to anything else
+	recent                   map[string]bool // channel/ts already handled: a mention arrives as two events
+	im                       string          // the owner's DM channel, opened once
 	st                       state
 	run                      string          // $KAMI_RUN of a script step's dm/canvas, for the transcript
 	links                    map[string]link // run id -> its thread, once known
@@ -217,12 +261,15 @@ type adapter struct {
 
 // --- Slack ---------------------------------------------------------------------
 
-// post sends e.Text to the owner's DM, threaded under e.ThreadTS when set,
-// and records e in the transcript (as kind error when the post fails). Blocks
-// are optional; text is always sent as the notification fallback.
+// post sends e.Text to e.Channel (the owner's DM when empty), threaded under
+// e.ThreadTS when set, and records e in the transcript (as kind error when the
+// post fails). Blocks are optional; text is always sent as the notification fallback.
 func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (string, string, error) {
 	e.Dir = "out"
-	im, err := a.dm(ctx)
+	im, err := e.Channel, error(nil)
+	if im == "" {
+		im, err = a.dm(ctx)
+	}
 	if err == nil {
 		opts := []slack.MsgOption{slack.MsgOptionText(e.Text, false)}
 		if blocks != nil {
@@ -244,6 +291,33 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 	return e.Channel, e.TS, nil
 }
 
+// pin pins or unpins a message. Already pinned / not pinned counts as done.
+func (a *adapter) pin(ctx context.Context, channel, ts string, on bool) error {
+	var err error
+	if channel == "" {
+		channel, err = a.dm(ctx)
+	}
+	e := entry{Dir: "out", Kind: "pin", Channel: channel, TS: ts, Text: "pin"}
+	if err == nil {
+		ref := slack.NewRefToMessage(channel, ts)
+		if on {
+			err = a.api.AddPinContext(ctx, channel, ref)
+		} else {
+			e.Text = "unpin"
+			err = a.api.RemovePinContext(ctx, channel, ref)
+		}
+		var se slack.SlackErrorResponse
+		if errors.As(err, &se) && (se.Err == "already_pinned" || se.Err == "no_pin") {
+			err = nil
+		}
+	}
+	if err != nil {
+		e.Kind, e.Error = "error", e.Text+": "+err.Error()
+	}
+	a.record(e)
+	return err
+}
+
 // dm returns the owner's DM channel, opening it on first use.
 func (a *adapter) dm(ctx context.Context) (string, error) {
 	if a.im == "" {
@@ -261,8 +335,8 @@ var slug = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 // canvas creates a canvas only the bot and the owner can see, or with a key
 // edits the canvas that key made before; it returns the permalink.
 // A key's canvas id lives in its own file, so parallel script steps never race.
-func (a *adapter) canvas(ctx context.Context, key, title, markdown string) (string, error) {
-	u, err := a.writeCanvas(ctx, key, title, markdown)
+func (a *adapter) canvas(ctx context.Context, key, title, markdown string, users []string) (string, error) {
+	u, err := a.writeCanvas(ctx, key, title, markdown, users)
 	e := entry{Dir: "out", Kind: "canvas", Text: markdown, Title: title, CanvasURL: u}
 	if err != nil {
 		e.Kind, e.Error = "error", err.Error()
@@ -271,7 +345,7 @@ func (a *adapter) canvas(ctx context.Context, key, title, markdown string) (stri
 	return u, err
 }
 
-func (a *adapter) writeCanvas(ctx context.Context, key, title, markdown string) (string, error) {
+func (a *adapter) writeCanvas(ctx context.Context, key, title, markdown string, users []string) (string, error) {
 	doc := slack.DocumentContent{Type: "markdown", Markdown: markdown}
 	var keyFile string
 	if key != "" {
@@ -294,7 +368,7 @@ func (a *adapter) writeCanvas(ctx context.Context, key, title, markdown string) 
 		return "", fmt.Errorf("create canvas: %w", err)
 	}
 	// Without access the owner's permalink 404s; no channel is ever granted.
-	if err := a.api.SetCanvasAccessContext(ctx, slack.SetCanvasAccessParams{CanvasID: id, AccessLevel: "write", UserIDs: []string{a.owner}}); err != nil {
+	if err := a.api.SetCanvasAccessContext(ctx, slack.SetCanvasAccessParams{CanvasID: id, AccessLevel: "write", UserIDs: append([]string{a.owner}, users...)}); err != nil {
 		return "", fmt.Errorf("grant canvas access: %w", err)
 	}
 	if keyFile != "" {
@@ -311,6 +385,29 @@ func (a *adapter) permalink(ctx context.Context, id string) (string, error) {
 		return "", fmt.Errorf("permalink for %s: %w", id, err)
 	}
 	return f.Permalink, nil
+}
+
+// answer resolves a contract with the owner's words, relayed by the chat run
+// in that thread. A human-only contract (gate, action, lock) refuses: only
+// the owner's own button press may answer it. serve posts the follow-up.
+func (a *adapter) answer(id, answer string, data map[string]any) error {
+	var c engine.ContractView
+	if err := a.kamiCall("GET", "/contracts/"+url.PathEscape(id), nil, &c); err != nil {
+		return err
+	}
+	e := entry{Dir: "in", Kind: "chat_answer", Text: answer, ContractID: id, RunID: c.RunID, Workflow: c.Workflow}
+	if c.Lock {
+		e.Error = "locked"
+		a.record(e)
+		return fmt.Errorf("contract %s is 🔒: only the owner's button press answers it", id)
+	}
+	err := a.kamiCall("POST", "/contracts/"+url.PathEscape(id)+"/resolve",
+		map[string]any{"answer": answer, "data": data, "note": "via POWER chat, from the owner's words"}, nil)
+	if err != nil {
+		e.Error = err.Error()
+	}
+	a.record(e)
+	return err
 }
 
 // --- Kami ----------------------------------------------------------------------
@@ -357,6 +454,8 @@ type state struct {
 	Since   int64               `json:"since"`           // last kami event handled
 	Threads map[string]*thread  `json:"threads"`         // contract id -> its DM
 	Queue   map[string][]queued `json:"queue,omitempty"` // chat thread key -> messages not yet handed to kami
+	Seen    map[string]string   `json:"seen,omitempty"`  // coworker user -> local day POWER last sent her picture
+	Cards   map[string]*card    `json:"cards,omitempty"` // top-level run id -> its status card
 }
 
 type queued struct {
@@ -378,7 +477,7 @@ type thread struct {
 func (a *adapter) statePath() string { return filepath.Join(a.dir, "slack.json") }
 
 func (a *adapter) load() error {
-	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}}
+	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Seen: map[string]string{}, Cards: map[string]*card{}}
 	raw, err := os.ReadFile(a.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -394,6 +493,12 @@ func (a *adapter) load() error {
 	}
 	if a.st.Queue == nil {
 		a.st.Queue = map[string][]queued{}
+	}
+	if a.st.Seen == nil {
+		a.st.Seen = map[string]string{}
+	}
+	if a.st.Cards == nil {
+		a.st.Cards = map[string]*card{}
 	}
 	return nil
 }
@@ -413,6 +518,16 @@ func writeAtomic(path string, raw []byte) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func splitIDs(s string) []string {
+	var out []string
+	for _, f := range strings.Split(s, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func contains(l []string, s string) bool {

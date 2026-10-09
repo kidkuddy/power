@@ -107,7 +107,7 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		defer k.mu.Unlock()
 		var req map[string]any
 		json.NewDecoder(r.Body).Decode(&req)
-		if req["workflow"] != "chat" {
+		if req["workflow"] != "chat" && req["workflow"] != "mr" {
 			env(w, nil, "NOT_FOUND", fmt.Sprintf("no workflow %q in kekkai work", req["workflow"]))
 			return
 		}
@@ -192,7 +192,14 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if to < len(msgs) {
 			out["response_metadata"] = map[string]any{"next_cursor": strconv.Itoa(to)}
 		}
-	case "canvases.edit", "canvases.access.set", "reactions.add":
+	case "files.getUploadURLExternal":
+		out = map[string]any{"upload_url": "http://" + r.Host + "/upload", "file_id": "FPIC"}
+	case "upload":
+		w.Write([]byte("OK"))
+		return
+	case "files.completeUploadExternal":
+		out = map[string]any{"files": []map[string]any{{"id": "FPIC", "title": "power.gif"}}}
+	case "canvases.edit", "canvases.access.set", "reactions.add", "pins.add", "pins.remove":
 		out = map[string]any{}
 	case "files.info":
 		out = map[string]any{"file": map[string]any{"id": r.Form.Get("file"), "permalink": "https://x.slack.com/docs/T1/" + r.Form.Get("file")}}
@@ -240,7 +247,7 @@ func setup(t *testing.T) (*fakeKami, *fakeSlack, func() *adapter) {
 	t.Cleanup(ss.Close)
 	start := func() *adapter {
 		a := &adapter{api: slack.New("xoxb-fake", slack.OptionAPIURL(ss.URL+"/")), kami: kamiClient(sock),
-			owner: owner, dir: filepath.Join(dir, "adapters"), chatKekkai: "work", chatWorkflow: "chat"}
+			owner: owner, dir: filepath.Join(dir, "adapters"), chatKekkai: "work", chatWorkflow: "chat", replyAnswers: true}
 		if err := a.load(); err != nil {
 			t.Fatal(err)
 		}
@@ -324,7 +331,7 @@ func TestServe(t *testing.T) {
 		t.Fatalf("refusal = %v", l)
 	}
 	must(a.onMessage(ctx, reply(owner, "100.2", "200.3", "Rated rating=good")))
-	if k.resolves[2] != "c2=rated map[rating:good]" || last().Get("text") != "✓ resolved → rated" {
+	if k.resolves[2] != "c2=rated map[rating:good]" || last().Get("text") != "✓ Got it: rated. POWER approves." {
 		t.Fatalf("form: resolves %v last %v", k.resolves, last())
 	}
 
@@ -342,7 +349,7 @@ func TestServe(t *testing.T) {
 	before := len(s.of("chat.postMessage"))
 	must(a.events(ctx))
 	if p := s.of("chat.postMessage"); len(p) != before+1 || p[before].Get("thread_ts") != "100.3" ||
-		!strings.Contains(p[before].Get("text"), "resolved by resolver → 8080") || len(a.st.Threads) != 0 {
+		!strings.Contains(p[before].Get("text"), "resolver already answered: 8080") || len(a.st.Threads) != 0 {
 		t.Fatalf("follow-ups = %v threads %v", p[before:], a.st.Threads)
 	}
 }
@@ -351,11 +358,11 @@ func TestCanvasAndDM(t *testing.T) {
 	ctx := context.Background()
 	_, s, start := setup(t)
 	a := start()
-	u1, err := a.canvas(ctx, "weekly", "Weekly", "# one")
+	u1, err := a.canvas(ctx, "weekly", "Weekly", "# one", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	u2, err := a.canvas(ctx, "weekly", "Weekly", "# two")
+	u2, err := a.canvas(ctx, "weekly", "Weekly", "# two", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +379,7 @@ func TestCanvasAndDM(t *testing.T) {
 	if _, ts, err := a.post(ctx, entry{Kind: "thread_reply", ThreadTS: "100.9", Text: "in thread"}, nil); err != nil || s.of("chat.postMessage")[0].Get("thread_ts") != "100.9" || ts == "" {
 		t.Fatalf("dm --thread: %v %v", err, s.of("chat.postMessage"))
 	}
-	if _, err := a.canvas(ctx, "../x", "t", ""); err == nil {
+	if _, err := a.canvas(ctx, "../x", "t", "", nil); err == nil {
 		t.Fatal("a path-like key was accepted")
 	}
 	ch, ts, err := a.post(ctx, entry{Kind: "dm", Text: "hello"}, nil)
@@ -501,7 +508,7 @@ func TestTranscript(t *testing.T) {
 	if _, _, err := a.post(ctx, entry{Kind: "dm", Text: "line one\nline two"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.canvas(ctx, "", "Weekly", "# body"); err != nil {
+	if _, err := a.canvas(ctx, "", "Weekly", "# body", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -548,7 +555,7 @@ func TestTranscript(t *testing.T) {
 	if e := find("thread_reply", 0); e.Dir != "in" || e.ContractID != "c2" || e.RunID != "r2" || e.Text != "8080" || e.ThreadTS != "100.2" || e.User != owner {
 		t.Fatalf("thread reply = %+v", e)
 	}
-	if e := find("followup", 0); e.ThreadTS != "100.2" || e.ContractID != "c2" || e.Text != "✓ resolved → 8080" || e.User != "" {
+	if e := find("followup", 0); e.ThreadTS != "100.2" || e.ContractID != "c2" || e.Text != "✓ Got it: 8080. POWER approves." || e.User != "" {
 		t.Fatalf("followup = %+v", e)
 	}
 	started, queued, signalled := find("chat_routed", 0), find("chat_routed", 1), find("chat_routed", 2)
@@ -768,14 +775,24 @@ func TestRunThreads(t *testing.T) {
 	for _, p := range s.of("chat.postMessage") {
 		got = append(got, post{p.Get("thread_ts"), strings.SplitN(p.Get("text"), "\n", 3)[min(1, strings.Count(p.Get("text"), "\n"))]})
 	}
-	want := []post{{"700.1", "*Which port?*"}, {"", "*Keep?*"}, {"700.1", "↳ started lint"}, {"700.1", "lint: 3 files"},
-		{"700.1", "✅ lint: clean"}, {"700.1", "❌ build failed: lint broke"}, {"800.1", "*Ship?*"}}
+	// rp's milestones and its child's go on one pinned card; only rp's result posts
+	want := []post{{"700.1", "*Which port?*"}, {"", "*Keep?*"}, {"700.1", "• ↳ lint `rc`: started"},
+		{"700.1", "❌ build failed: lint broke. Not POWER's fault!"}, {"800.1", "*Ship?*"}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("posts:\n got %v\nwant %v", got, want)
 	}
 	posts := s.of("chat.postMessage")
-	if !strings.Contains(posts[6].Get("blocks"), `"action_id":"kami:c5:0"`) || a.st.Since != 12 {
-		t.Fatalf("c5 in its thread lost its buttons: %v (since %d)", posts[6], a.st.Since)
+	if !strings.Contains(posts[4].Get("blocks"), `"action_id":"kami:c5:0"`) || a.st.Since != 12 {
+		t.Fatalf("c5 in its thread lost its buttons: %v (since %d)", posts[4], a.st.Since)
+	}
+	ups := s.of("chat.update")
+	if card := ups[len(ups)-1]; card.Get("ts") != posts[2].Get("ts") && card.Get("ts") != "100.3" ||
+		!strings.Contains(card.Get("text"), "• ↳ lint `rc`: ✅ lint: clean. POWER wins again!") || !strings.Contains(card.Get("text"), "*❌ failed*") ||
+		strings.Count(card.Get("text"), "↳") != 1 {
+		t.Fatalf("card = %v", card)
+	}
+	if p := s.of("pins.add"); len(p) != 1 || p[0].Get("timestamp") != "100.3" {
+		t.Fatalf("pins = %v", p)
 	}
 	if th := a.st.Threads; th["c1"].Thread != "700.1" || th["c1"].TS != "100.1" || th["cN"].Thread != "" || th["c5"].Thread != "800.1" {
 		t.Fatalf("threads = %+v %+v %+v", th["c1"], th["cN"], th["c5"])
@@ -790,14 +807,21 @@ func TestRunThreads(t *testing.T) {
 			t.Fatalf("contract entry = %+v", e)
 		}
 	}
-	if strings.Join(ms, " ") != "rc/lint@700.1 rc/lint@700.1 rc/lint@700.1 rp/build@700.1" {
+	if strings.Join(ms, " ") != "rp/build@700.1" {
 		t.Fatalf("milestone entries = %v", ms)
 	}
+
+	// the top-level run that finished in the thread is told to the chat listening there
+	if len(k.signals) != 1 || k.signals[0]["key"] != "700.1" ||
+		k.signals[0]["data"].(map[string]any)["text"] != "[kami] build failed: lint broke. Not POWER's fault! (run rp)" {
+		t.Fatalf("finish signals = %v", k.signals)
+	}
+	k.signals = nil
 
 	last := func() url.Values { p := s.of("chat.postMessage"); return p[len(p)-1] }
 	// a reply in the run thread answers its one open ask
 	must(a.onMessage(ctx, reply(owner, "700.1", "701.1", "use port 8080")))
-	if len(k.resolves) != 1 || k.resolves[0] != "c1=use port 8080 map[]" || last().Get("thread_ts") != "700.1" || last().Get("text") != "✓ resolved → use port 8080" {
+	if len(k.resolves) != 1 || k.resolves[0] != "c1=use port 8080 map[]" || last().Get("thread_ts") != "700.1" || last().Get("text") != "✓ Got it: use port 8080. POWER approves." {
 		t.Fatalf("ask in run thread: resolves %v last %v", k.resolves, last())
 	}
 	if len(k.signals) != 0 {
@@ -842,7 +866,7 @@ func TestRunThreads(t *testing.T) {
 	k.events = append(k.events, ev(15, "contract.cancelled", "rc", map[string]any{"id": "c2"}))
 	k.mu.Unlock()
 	must(a.events(ctx))
-	if l := last(); l.Get("thread_ts") != "700.1" || !strings.Contains(l.Get("text"), "cancelled") {
+	if l := last(); l.Get("thread_ts") != "700.1" || !strings.Contains(l.Get("text"), "Cancelled") {
 		t.Fatalf("follow-up = %v", l)
 	}
 }
@@ -885,9 +909,86 @@ func TestWorkerAskInRunThread(t *testing.T) {
 	if err := a.onMessage(ctx, reply(owner, "900.1", "901.1", "the kami repo")); err != nil {
 		t.Fatal(err)
 	}
+	// without --reply-answers the same reply goes to chat, with the thread's open contracts
+	a.replyAnswers = false
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(a.onMessage(ctx, reply(owner, "900.1", "901.2", "how is it going?")))
+	if len(k.resolves) != 1 || len(k.signals) != 1 || k.signals[0]["data"].(map[string]any)["thread_contracts"] != "cw" ||
+		len(k.started) != 1 || inputsOf(k, 0)["thread_contracts"] != "cw" {
+		t.Fatalf("chat routing: resolves %v signals %v started %v", k.resolves, k.signals, k.started)
+	}
 	p := s.of("chat.postMessage")
-	if len(k.resolves) != 1 || k.resolves[0] != "cw=the kami repo map[]" || len(k.signals) != 0 || len(k.started) != 0 ||
-		p[len(p)-1].Get("thread_ts") != "900.1" || p[len(p)-1].Get("text") != "✓ resolved → the kami repo" {
+	if len(k.resolves) != 1 || k.resolves[0] != "cw=the kami repo map[]" ||
+		p[len(p)-1].Get("thread_ts") != "900.1" || p[len(p)-1].Get("text") != "✓ Got it: the kami repo. POWER approves." {
 		t.Fatalf("worker ask: resolves %v signals %v last %v", k.resolves, k.signals, p[len(p)-1])
+	}
+}
+
+func TestCoworkers(t *testing.T) {
+	ctx := context.Background()
+	k, s, start := setup(t)
+	a := start()
+	a.coworkers, a.mrWorkflow = true, "mr"
+	a.picture = filepath.Join(a.dir, "power.gif")
+	os.MkdirAll(a.dir, 0o700)
+	os.WriteFile(a.picture, []byte("GIF89a"), 0o600)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ch := func(user, ts, text string) *slackevents.MessageEvent {
+		return &slackevents.MessageEvent{ChannelType: "channel", Channel: "C1", User: user, TimeStamp: ts, Text: text}
+	}
+
+	// an MR link in a channel: one question with two buttons in its thread; the app_mention twin is dropped
+	link := "<https://gitlab.com/acme/web/-/merge_requests/42|!42>"
+	must(a.onMessage(ctx, ch("UBOB", "10.1", "<@UPOWER> look "+link)))
+	must(a.onCoworker(ctx, coMsg{"UBOB", "look " + link, "C1", "10.1", ""}))
+	posts := s.of("chat.postMessage")
+	if len(posts) != 1 || posts[0].Get("channel") != "C1" || posts[0].Get("thread_ts") != "10.1" ||
+		!strings.Contains(posts[0].Get("blocks"), "power:review") || !strings.Contains(posts[0].Get("blocks"), "power:approve") {
+		t.Fatalf("posts = %v", posts)
+	}
+	val, _ := json.Marshal(mrAsk{URL: "https://gitlab.com/acme/web/-/merge_requests/42", Requester: "UBOB", Channel: "C1", Thread: "10.1"})
+
+	// someone else's tap does nothing; the requester's starts the mr workflow and redraws
+	must(a.onMRTap(ctx, "UEVE", "C1", "100.1", "approve", string(val)))
+	if len(k.started) != 0 {
+		t.Fatal("a stranger's tap started a run")
+	}
+	must(a.onMRTap(ctx, "UBOB", "C1", "100.1", "approve", string(val)))
+	if len(k.started) != 1 || k.started[0]["workflow"] != "mr" {
+		t.Fatalf("started = %v", k.started)
+	}
+	if in := k.started[0]["inputs"].(map[string]any); in["action"] != "approve" || in["reply_ts"] != "10.1" || in["requester"] != "UBOB" ||
+		in["url"] != "https://gitlab.com/acme/web/-/merge_requests/42" {
+		t.Fatalf("inputs = %v", in)
+	}
+	if u := s.of("chat.update"); len(u) != 1 || strings.Contains(u[0].Get("blocks"), "power:") {
+		t.Fatalf("redraw = %v", u)
+	}
+
+	// anything else: the picture once a day, then "no :)"; a non-owner DM counts too
+	must(a.onMessage(ctx, reply("UBOB", "", "11.1", "hi")))
+	must(a.onMessage(ctx, ch("UBOB", "12.1", "hello?")))
+	if up := s.of("files.completeUploadExternal"); len(up) != 1 || up[0].Get("channel_id") != "D1" || up[0].Get("thread_ts") != "11.1" {
+		t.Fatalf("uploads = %v", up)
+	}
+	if p := s.of("chat.postMessage"); len(p) != 2 || p[1].Get("text") != "no :)" || p[1].Get("thread_ts") != "12.1" {
+		t.Fatalf("posts = %v", p)
+	}
+
+	// off: a non-owner DM is ignored again, the owner's DM still goes to chat
+	a.coworkers = false
+	must(a.onMessage(ctx, reply("UBOB", "", "13.1", "hi")))
+	if len(s.of("chat.postMessage")) != 2 || len(s.of("files.completeUploadExternal")) != 1 {
+		t.Fatal("coworker answered with the flag off")
 	}
 }

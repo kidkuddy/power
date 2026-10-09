@@ -56,8 +56,13 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 					continue
 				}
 				sm.Ack(*evt.Request)
-				if m, ok := ev.InnerEvent.Data.(*slackevents.MessageEvent); ok {
+				switch m := ev.InnerEvent.Data.(type) {
+				case *slackevents.MessageEvent:
 					a.logErr(a.onMessage(ctx, m))
+				case *slackevents.AppMentionEvent:
+					if m.BotID == "" && m.User != "" && a.coworkers {
+						a.logErr(a.onCoworker(ctx, coMsg{m.User, m.Text, m.Channel, m.TimeStamp, m.ThreadTimeStamp}))
+					}
 				}
 			case socketmode.EventTypeInteractive:
 				cb, ok := evt.Data.(slack.InteractionCallback)
@@ -157,27 +162,55 @@ func (a *adapter) milestone(ctx context.Context, ev eventbus.Event) error {
 	case "run.say":
 		text, _ = ev.Data["text"].(string)
 	case "run.started":
-		text = "↳ started " + l.workflow
+		text = "↳ POWER started " + l.workflow
 	case "run.finished":
 		status, _ := ev.Data["status"].(string)
 		report, _ := ev.Data["report"].(string)
+		brag := " POWER wins again!"
 		if status == engine.StDone {
 			text = "✅ " + l.workflow
 		} else {
-			text = "❌ " + l.workflow + " " + status
+			text, brag = "❌ "+l.workflow+" "+status, " Not POWER's fault!"
 		}
-		if report = strings.TrimSpace(report); report != "" {
+		if report = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(report), ".")); report != "" {
 			text += ": " + report
 		}
+		text += "." + brag
 	}
 	if strings.TrimSpace(text) == "" {
 		return nil
+	}
+	if l.workflow != a.chatWorkflow {
+		root := l
+		if l.root != ev.Run {
+			if root, err = a.runLink(l.root, 0); err != nil {
+				return err
+			}
+		}
+		if root.workflow != a.chatWorkflow { // a goal's milestones go on its card; only its result posts
+			if err := a.onCard(ctx, l.root, root, ev, l.workflow, text); err != nil || ev.Type != "run.finished" || ev.Run != l.root {
+				return err
+			}
+		}
 	}
 	_, _, err = a.post(ctx, entry{Kind: "milestone", ThreadTS: l.thread, Text: text, RunID: ev.Run, Workflow: l.workflow}, nil)
 	if badThread(err) {
 		return nil // a thread_ts that is not a thread of the owner DM: the error entry is the record
 	}
+	if err == nil && ev.Type == "run.finished" && l.parent == "" && l.workflow != a.chatWorkflow {
+		a.tellChat(l.thread, "[kami] "+strings.TrimPrefix(strings.TrimPrefix(text, "✅ "), "❌ ")+" (run "+ev.Run+")")
+	}
 	return err
+}
+
+// tellChat signals the chat run listening on a thread, if any: a top-level run
+// there finished, so POWER can sum up or offer to wrap up. Nobody listening: dropped.
+func (a *adapter) tellChat(thread, text string) {
+	if a.chatWorkflow == "" {
+		return
+	}
+	a.logErr(a.kamiCall("POST", "/signal", map[string]any{"kekkai": a.chatKekkai, "type": "slack.message", "key": thread,
+		"data": map[string]any{"text": text, "ts": "", "history": "", "thread_contracts": a.threadContracts(thread)}}, nil))
 }
 
 // badThread is Slack refusing a thread_ts. Retrying cannot fix it, and a
@@ -187,7 +220,7 @@ func badThread(err error) bool {
 	return errors.As(err, &se) && (se.Err == "invalid_thread_ts" || se.Err == "thread_not_found")
 }
 
-type link struct{ thread, workflow string }
+type link struct{ thread, workflow, parent, root string } // root: the top-level run's id
 
 // runLink finds a run's Slack thread: its var thread_ts, else its parent's,
 // up the chain. Only runs with a thread are cached: a run may set thread_ts later.
@@ -208,14 +241,17 @@ func (a *adapter) runLink(id string, depth int) (link, error) {
 	if err != nil {
 		return link{}, err
 	}
-	l := link{workflow: r.Workflow}
+	l := link{workflow: r.Workflow, parent: r.Parent, root: id}
 	l.thread, _ = r.Vars["thread_ts"].(string)
-	if l.thread == "" && r.Parent != "" && depth < 32 {
+	if r.Parent != "" && depth < 32 {
 		p, err := a.runLink(r.Parent, depth+1)
 		if err != nil {
 			return link{}, err
 		}
-		l.thread = p.thread
+		l.root = p.root
+		if l.thread == "" {
+			l.thread = p.thread
+		}
 	}
 	if l.thread != "" {
 		if a.links == nil {
@@ -295,23 +331,23 @@ func (a *adapter) handle(ctx context.Context, ev eventbus.Event) error {
 			by, _ := ev.Data["by"].(string)
 			ans, _ := ev.Data["answer"].(string)
 			a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by %s", ans, by))
-			if _, _, err := a.post(ctx, t.note("followup", id, fmt.Sprintf("✓ resolved by %s → %s. No reply needed.", by, ans)), nil); err != nil {
+			if _, _, err := a.post(ctx, t.note("followup", id, fmt.Sprintf("✓ %s already answered: %s. POWER needs nothing more from you.", by, ans)), nil); err != nil {
 				return err
 			}
 		}
 		delete(a.st.Threads, id)
 	case "contract.cancelled":
 		a.settle(ctx, id, t, "cancelled")
-		if _, _, err := a.post(ctx, t.note("followup", id, "✗ cancelled (the run moved on). No reply needed."), nil); err != nil {
+		if _, _, err := a.post(ctx, t.note("followup", id, "✗ Cancelled, the run moved on without you. Nothing to do."), nil); err != nil {
 			return err
 		}
 		delete(a.st.Threads, id)
 	case "contract.resolver_failed":
 		why, _ := ev.Data["error"].(string)
-		_, _, err := a.post(ctx, t.note("followup", id, "⚠ the AFK resolver failed: "+why+"\nIt is back with you: answer above or reply here."), nil)
+		_, _, err := a.post(ctx, t.note("followup", id, "⚠ POWER's AFK helper gave up: "+why+"\nSo it's yours, human. Answer above or reply here."), nil)
 		return err
 	case "contract.grace_expired":
-		_, _, err := a.post(ctx, t.note("followup", id, "⏱ grace period over; the AFK resolver is answering now."), nil)
+		_, _, err := a.post(ctx, t.note("followup", id, "⏱ Too slow! Grace is over, POWER's AFK helper is answering now."), nil)
 		return err
 	}
 	return nil
@@ -354,6 +390,11 @@ const actionPrefix = "kami:"
 func (a *adapter) onAction(ctx context.Context, cb slack.InteractionCallback) error {
 	if cb.Type != slack.InteractionTypeBlockActions {
 		return nil
+	}
+	for _, act := range cb.ActionCallback.BlockActions {
+		if what, ok := strings.CutPrefix(act.ActionID, mrPrefix); ok {
+			return a.onMRTap(ctx, cb.User.ID, cb.Channel.ID, cb.Message.Timestamp, what, act.Value)
+		}
 	}
 	if cb.User.ID != a.owner {
 		for _, act := range cb.ActionCallback.BlockActions {
@@ -398,7 +439,16 @@ func (a *adapter) onAction(ctx context.Context, cb slack.InteractionCallback) er
 // contract; anything else goes to a chat run.
 func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) error {
 	// The bot's own posts come back as events; the transcript has them as "out".
-	if m.ChannelType != "im" || m.BotID != "" || m.User == "" {
+	if m.BotID != "" || m.User == "" {
+		return nil
+	}
+	if a.isCoworker(m.ChannelType, m.User) {
+		if m.SubType != "" && m.SubType != "thread_broadcast" && m.SubType != "file_share" {
+			return nil // joins, edits, deletions
+		}
+		return a.onCoworker(ctx, coMsg{m.User, m.Text, m.Channel, m.TimeStamp, m.ThreadTimeStamp})
+	}
+	if m.ChannelType != "im" {
 		return nil
 	}
 	inThread := m.ThreadTimeStamp != "" && m.ThreadTimeStamp != m.TimeStamp
@@ -419,8 +469,9 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		_, err := a.resolve(ctx, id, t, ans, data, true)
 		return err
 	}
+	// Without --reply-answers every reply goes to the chat run, which answers contracts itself (kami-slack answer).
 	for id, t := range a.st.Threads { // the thread under a top-level contract message
-		if !inThread || t.Thread != "" || t.TS != m.ThreadTimeStamp {
+		if !a.replyAnswers || !inThread || t.Thread != "" || t.TS != m.ThreadTimeStamp {
 			continue
 		}
 		var c engine.ContractView
@@ -429,7 +480,7 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		}
 		return answer(id, t, &c)
 	}
-	if inThread { // a run's thread: the reply answers its one open contract that takes text
+	if inThread && a.replyAnswers { // a run's thread: the reply answers its one open contract that takes text
 		var hit string
 		var hitView *engine.ContractView
 		n := 0
@@ -507,7 +558,7 @@ func (a *adapter) route(ctx context.Context, key string) error {
 		Delivered []string `json:"delivered"`
 	}
 	err := a.kamiCall("POST", "/signal", map[string]any{"kekkai": a.chatKekkai, "type": "slack.message", "key": key,
-		"data": map[string]any{"text": q[0].Text, "ts": q[0].TS, "history": ""}}, &sig)
+		"data": map[string]any{"text": q[0].Text, "ts": q[0].TS, "history": "", "thread_contracts": a.threadContracts(key)}}, &sig)
 	if err != nil {
 		return err
 	}
@@ -554,7 +605,7 @@ func (a *adapter) route(ctx context.Context, key string) error {
 		ID string `json:"id"`
 	}
 	err = a.kamiCall("POST", "/runs", map[string]any{"kekkai": a.chatKekkai, "workflow": a.chatWorkflow,
-		"inputs": map[string]any{"thread_ts": key, "channel": im, "text": strings.Join(texts, "\n\n"), "history": history, "thread_runs": tied}}, &run)
+		"inputs": map[string]any{"thread_ts": key, "channel": im, "text": strings.Join(texts, "\n\n"), "history": history, "thread_runs": tied, "thread_contracts": a.threadContracts(key)}}, &run)
 	var ke *kamiErr
 	if err != nil && !errors.As(err, &ke) {
 		return err // kami unreachable: keep the queue, retry next tick
@@ -569,11 +620,23 @@ func (a *adapter) route(ctx context.Context, key string) error {
 		return serr
 	}
 	if ke != nil {
-		_, _, err = a.post(ctx, entry{Kind: "error", ThreadTS: key, Text: "✗ could not start " + a.chatWorkflow + ": " + ke.Message,
+		_, _, err = a.post(ctx, entry{Kind: "error", ThreadTS: key, Text: "✗ POWER could not start " + a.chatWorkflow + ": " + ke.Message,
 			Workflow: a.chatWorkflow, Error: ke.Message}, nil)
 		return err
 	}
 	return nil
+}
+
+// threadContracts is the ids of the open contracts posted in a thread, or as its root.
+func (a *adapter) threadContracts(key string) string {
+	var ids []string
+	for id, t := range a.st.Threads {
+		if t.Thread == key || t.TS == key {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, ",")
 }
 
 func (a *adapter) pop(key string, n int) {
@@ -641,7 +704,7 @@ func (a *adapter) resolve(ctx context.Context, id string, t *thread, answer stri
 	err := a.kamiCall("POST", "/contracts/"+url.PathEscape(id)+"/resolve", body, &out)
 	var ke *kamiErr
 	if errors.As(err, &ke) {
-		e := t.note("error", id, "✗ "+ke.Message+"\nTry again.")
+		e := t.note("error", id, "✗ Kami refused: "+ke.Message+"\nTry again, human.")
 		e.Error = ke.Message
 		_, _, err = a.post(ctx, e, nil)
 		return "", err
@@ -658,7 +721,7 @@ func (a *adapter) resolve(ctx context.Context, id string, t *thread, answer stri
 	}
 	a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by <@%s>", answer, a.owner))
 	if inThread {
-		_, _, err = a.post(ctx, t.note("followup", id, "✓ resolved → "+answer), nil)
+		_, _, err = a.post(ctx, t.note("followup", id, "✓ Got it: "+answer+". POWER approves."), nil)
 	}
 	return answer, err
 }
@@ -719,7 +782,7 @@ const maxBody = 2000 // a section block holds 3000 characters
 
 func render(c *engine.ContractView) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "*Kami decision* · %s / %s (%s)\n*%s*\n", c.Workflow, c.Step, c.Kind, c.Title)
+	fmt.Fprintf(&b, "*POWER demands a decision!* · %s / %s (%s)\n*%s*\n", c.Workflow, c.Step, c.Kind, c.Title)
 	if body := strings.TrimSpace(c.Body); body != "" {
 		if r := []rune(body); len(r) > maxBody {
 			body = string(r[:maxBody]) + fmt.Sprintf("\n… (cut at %d of %d characters; `kami contract show %s` has it all)", maxBody, len(r), c.ID)
@@ -755,11 +818,11 @@ func render(c *engine.ContractView) string {
 	b.WriteString(mode + "\n")
 	switch {
 	case len(c.Fields) > 0:
-		b.WriteString("↩ Reply in this thread: `answer field=value …`")
+		b.WriteString("↩ Reply in this thread, POWER is waiting: `answer field=value …`")
 	case len(c.Options) > 0:
-		b.WriteString("Tap an answer, or reply in this thread with one.")
+		b.WriteString("Tap one, human. Or reply in this thread with one.")
 	default:
-		b.WriteString("↩ Reply in this thread with your answer (any text).")
+		b.WriteString("↩ Reply in this thread with your answer (any text). POWER is waiting.")
 	}
 	fmt.Fprintf(&b, "\n_contract `%s` · run `%s`_", c.ID, c.RunID)
 	return b.String()
