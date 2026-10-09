@@ -88,7 +88,7 @@ func (a *adapter) routeConv(ctx context.Context, key string, m coMsg) error {
 		text = strings.Join(lines, "\n")
 	}
 	_, kind, reply, place := a.convOf(m)
-	data := map[string]any{"text": text, "ts": last.TS, "from": last.From, "from_name": last.Name, "owner_msg": last.Owner, "reply_ts": reply}
+	data := map[string]any{"text": text, "ts": last.TS, "from": last.From, "from_name": last.Name, "owner_msg": last.Owner}
 	var sig struct {
 		Delivered []string `json:"delivered"`
 	}
@@ -114,7 +114,9 @@ func (a *adapter) routeConv(ctx context.Context, key string, m coMsg) error {
 			return nil // busy thinking: stays queued for the next tick
 		}
 	}
-	in := map[string]any{"kami_conv": kind, "kami_channel": m.channel, "key": key, "place": place, "history": a.convHistory(ctx, m, q)}
+	// kami_*: where this session speaks and what it may remember; inputs only, nothing can change them later
+	in := map[string]any{"kami_conv": kind, "kami_channel": m.channel, "kami_reply_ts": reply, "key": key, "place": place,
+		"history": a.convHistory(ctx, m, q)}
 	if kind == "dm" {
 		in["kami_peer"] = m.user
 	}

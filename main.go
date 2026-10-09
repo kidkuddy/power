@@ -333,6 +333,11 @@ func (a *adapter) upload(ctx context.Context, channel, thread, path string) erro
 		channel, err = a.dm(ctx)
 	}
 	e := entry{Dir: "out", Kind: "picture", Channel: channel, ThreadTS: thread, Text: path}
+	switch strings.ToLower(filepath.Ext(path)) { // pictures only: never a way to post an arbitrary file
+	case ".gif", ".png", ".jpg", ".jpeg", ".webp":
+	default:
+		err = fmt.Errorf("%s: only images (gif, png, jpg, webp) can be uploaded", path)
+	}
 	if err == nil {
 		var fi os.FileInfo
 		if fi, err = os.Stat(path); err == nil {

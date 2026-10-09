@@ -999,7 +999,7 @@ func TestCoworkers(t *testing.T) {
 	must(a.onMessage(ctx, reply("UBOB", "", "11.1", "hi")))
 	in := k.started[1]["inputs"].(map[string]any)
 	if k.started[1]["workflow"] != "converse" || in["kami_conv"] != "dm" || in["kami_peer"] != "UBOB" || in["key"] != "dm:D1" ||
-		in["reply_ts"] != "" || in["owner_msg"] != false || in["from_name"] != "name-UBOB" || !strings.Contains(in["place"].(string), "DM") {
+		in["kami_reply_ts"] != "" || in["owner_msg"] != false || in["from_name"] != "name-UBOB" || !strings.Contains(in["place"].(string), "DM") {
 		t.Fatalf("dm session = %v", k.started[1])
 	}
 	// …a channel's main conversation (the owner, here)…
@@ -1013,7 +1013,7 @@ func TestCoworkers(t *testing.T) {
 		{"ts": "30.2", "bot_id": "B1", "text": "never"}, {"ts": "30.3", "user": owner, "text": "<@UPOWER> be nice"}}
 	must(a.onCoworker(ctx, coMsg{owner, "<@UPOWER> be nice", "C1", "30.3", "30.1", "channel"}))
 	in = k.started[3]["inputs"].(map[string]any)
-	if in["key"] != "thr:C1:30.1" || in["reply_ts"] != "30.1" || in["history"] != "name-UBOB: ship it?\nPOWER (you): never" {
+	if in["key"] != "thr:C1:30.1" || in["kami_reply_ts"] != "30.1" || in["history"] != "name-UBOB: ship it?\nPOWER (you): never" {
 		t.Fatalf("thread session = %v", in)
 	}
 	// a waiting session gets the next message as a signal; a busy one queues it, then one labeled turn

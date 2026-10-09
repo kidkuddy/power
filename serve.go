@@ -612,7 +612,8 @@ func (a *adapter) route(ctx context.Context, key string) error {
 		ID string `json:"id"`
 	}
 	err = a.kamiCall("POST", "/runs", map[string]any{"kekkai": a.chatKekkai, "workflow": a.chatWorkflow,
-		"inputs": map[string]any{"thread_ts": key, "channel": im, "text": strings.Join(texts, "\n\n"), "history": history, "thread_runs": tied, "thread_contracts": a.threadContracts(key)}}, &run)
+		"inputs": map[string]any{"thread_ts": key, "channel": im, "text": strings.Join(texts, "\n\n"), "history": history, "thread_runs": tied,
+			"thread_contracts": a.threadContracts(key), "kami_conv": "owner"}}, &run)
 	var ke *kamiErr
 	if err != nil && !errors.As(err, &ke) {
 		return err // kami unreachable: keep the queue, retry next tick
