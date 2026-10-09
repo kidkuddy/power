@@ -331,8 +331,14 @@ func (a *adapter) handle(ctx context.Context, ev eventbus.Event) error {
 			by, _ := ev.Data["by"].(string)
 			ans, _ := ev.Data["answer"].(string)
 			a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by %s", ans, by))
-			if _, _, err := a.post(ctx, t.note("followup", id, fmt.Sprintf("✓ %s already answered: %s. POWER needs nothing more from you.", by, ans)), nil); err != nil {
+			done, err := a.afkOnCard(ctx, t, by, ans)
+			if err != nil {
 				return err
+			}
+			if !done {
+				if _, _, err := a.post(ctx, t.note("followup", id, fmt.Sprintf("✓ %s already answered: %s. POWER needs nothing more from you.", by, ans)), nil); err != nil {
+					return err
+				}
 			}
 		}
 		delete(a.st.Threads, id)

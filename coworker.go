@@ -125,11 +125,17 @@ func (a *adapter) onMRTap(ctx context.Context, user, channel, msgTS, action, val
 		a.record(in)
 		return nil
 	}
+	// who pressed, so mr-approve can refuse an author approving their own MR
+	var name, email string
+	if u, err := a.api.GetUserInfoContext(ctx, user); err == nil {
+		name, email = u.RealName, u.Profile.Email
+	}
 	var run struct {
 		ID string `json:"id"`
 	}
 	err := a.kamiCall("POST", "/runs", map[string]any{"kekkai": a.chatKekkai, "workflow": a.mrWorkflow,
-		"inputs": map[string]any{"url": q.URL, "action": action, "channel": q.Channel, "reply_ts": q.Thread, "requester": q.Requester}}, &run)
+		"inputs": map[string]any{"url": q.URL, "action": action, "channel": q.Channel, "reply_ts": q.Thread, "requester": q.Requester,
+			"requester_name": name, "requester_email": email}}, &run)
 	in.RunID = run.ID
 	var ke *kamiErr
 	if errors.As(err, &ke) {

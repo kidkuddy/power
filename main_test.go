@@ -871,6 +871,17 @@ func TestRunThreads(t *testing.T) {
 	if l := last(); l.Get("thread_ts") != "700.1" || !strings.Contains(l.Get("text"), "Cancelled") {
 		t.Fatalf("follow-up = %v", l)
 	}
+
+	// an AFK answer in rp's tree goes on rp's card, not into a message of its own
+	n := len(s.of("chat.postMessage"))
+	k.mu.Lock()
+	k.events = append(k.events, ev(16, "contract.resolved", "rp", map[string]any{"id": "c3", "by": "resolver", "answer": "good\nbecause"}))
+	k.mu.Unlock()
+	must(a.events(ctx))
+	ups = s.of("chat.update")
+	if len(s.of("chat.postMessage")) != n || !strings.Contains(ups[len(ups)-1].Get("text"), "• 🤖 AFK answered: good …") {
+		t.Fatalf("afk on card: posts %d→%d, last update %v", n, len(s.of("chat.postMessage")), ups[len(ups)-1])
+	}
 }
 
 func inputsOf(k *fakeKami, i int) map[string]any {

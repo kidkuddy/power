@@ -112,3 +112,38 @@ func (a *adapter) wrap(ctx context.Context, thread string) error {
 	}
 	return err
 }
+
+// afkOnCard puts an AFK resolver's answer on its run tree's card instead of a
+// message of its own; false when there is no card (or a human answered).
+func (a *adapter) afkOnCard(ctx context.Context, t *thread, by, answer string) (bool, error) {
+	if by != "resolver" || t.RunID == "" {
+		return false, nil
+	}
+	l, err := a.runLink(t.RunID, 0)
+	if err != nil || l.root == "" { // the run is gone
+		return false, err
+	}
+	root := l
+	if l.root != t.RunID {
+		if root, err = a.runLink(l.root, 0); err != nil {
+			return false, err
+		}
+	}
+	if a.st.Cards[l.root] == nil || root.workflow == a.chatWorkflow {
+		return false, nil
+	}
+	if r := []rune(firstLineOf(answer)); len(r) > 120 {
+		answer = string(r[:119]) + "…"
+	} else {
+		answer = string(r)
+	}
+	return true, a.onCard(ctx, l.root, root, eventbus.Event{Run: l.root, Type: "run.say"}, root.workflow, "🤖 AFK answered: "+answer)
+}
+
+func firstLineOf(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i] + " …"
+	}
+	return s
+}
