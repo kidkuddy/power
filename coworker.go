@@ -18,7 +18,9 @@ import (
 // starts --mr-workflow. Anything else gets the picture once a day per
 // person, then "no :)".
 
-var mrURL = regexp.MustCompile(`https?://[^\s<>|/]*gitlab[^\s<>|/]*/[^\s<>|]+?/-/merge_requests/\d+`)
+// Only gitlab.com, the host glab acts on: a link to any other host must not
+// become an approval of the same path on gitlab.com. Same pattern as mr-open's MR_URL.
+var mrURL = regexp.MustCompile(`https://gitlab\.com/[A-Za-z0-9][A-Za-z0-9._/-]*/-/merge_requests/\d+\b`)
 
 const mrPrefix = "power:" // action ids power:review and power:approve
 
