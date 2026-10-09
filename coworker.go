@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/slack-go/slack"
@@ -81,7 +82,7 @@ func (a *adapter) onCoworker(ctx context.Context, m coMsg) error {
 			return err
 		}
 	}
-	return a.banter(m)
+	return a.banter(ctx, m)
 }
 
 // ponytail: a flat daily cap per coworker; per-hour buckets if 20 proves too blunt.
@@ -89,7 +90,7 @@ const banterPerDay = 20
 
 // banter starts --banter-workflow: Claude with no tools writes POWER's one-liner
 // into the message's thread ("yes senpai" when it is the owner).
-func (a *adapter) banter(m coMsg) error {
+func (a *adapter) banter(ctx context.Context, m coMsg) error {
 	root := m.thread
 	if root == "" {
 		root = m.ts
@@ -98,7 +99,8 @@ func (a *adapter) banter(m coMsg) error {
 		ID string `json:"id"`
 	}
 	err := a.kamiCall("POST", "/runs", map[string]any{"kekkai": a.chatKekkai, "workflow": a.banterWorkflow,
-		"inputs": map[string]any{"text": unslack(m.text), "user": m.user, "owner": m.user == a.owner, "channel": m.channel, "reply_ts": root}}, &run)
+		"inputs": map[string]any{"text": unslack(m.text), "user": m.user, "name": a.name(ctx, m.user), "owner": m.user == a.owner,
+			"channel": m.channel, "reply_ts": root, "history": a.banterHistory(ctx, m.channel, root, m.ts)}}, &run)
 	e := entry{Dir: "in", Kind: "chat_routed", Channel: m.channel, TS: m.ts, ThreadTS: root, User: m.user, Text: m.text,
 		Routed: "started", RunID: run.ID, Workflow: a.banterWorkflow}
 	if err != nil {
@@ -154,4 +156,59 @@ func (a *adapter) onMRTap(ctx context.Context, user, channel, msgTS, action, val
 // channel, or a DM from someone other than the owner.
 func (a *adapter) isCoworker(channelType, user string) bool {
 	return a.coworkers && (channelType != "im" || user != a.owner)
+}
+
+// ponytail: the last 20 messages; a long thread's start is dropped.
+const banterHistory = 20
+
+// banterHistory is the thread before ts as "name: text" lines, so POWER knows
+// who said what. Empty when the thread cannot be read (channels need
+// channels:history / groups:history; DMs work with im:history).
+func (a *adapter) banterHistory(ctx context.Context, channel, root, ts string) string {
+	if root == ts {
+		return "" // a new message, not a thread reply
+	}
+	msgs, err := a.repliesIn(ctx, channel, root)
+	if err != nil {
+		a.logErr(fmt.Errorf("banter history: %w", err))
+		return ""
+	}
+	var lines []string
+	for _, m := range msgs {
+		if m.Timestamp == ts {
+			continue
+		}
+		who := "POWER (you)"
+		if m.BotID == "" {
+			who = a.name(ctx, m.User)
+		}
+		lines = append(lines, who+": "+unslack(m.Text))
+	}
+	if len(lines) > banterHistory {
+		lines = lines[len(lines)-banterHistory:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// name is a Slack user's display name ("the owner (owner)" for the owner),
+// cached; the id when the lookup fails.
+func (a *adapter) name(ctx context.Context, user string) string {
+	if n, ok := a.names[user]; ok {
+		return n
+	}
+	n := user
+	if u, err := a.api.GetUserInfoContext(ctx, user); err == nil {
+		n = u.Profile.DisplayName
+		if n == "" {
+			n = u.RealName
+		}
+	}
+	if user == a.owner {
+		n += " (owner)"
+	}
+	if a.names == nil {
+		a.names = map[string]string{}
+	}
+	a.names[user] = n
+	return n
 }

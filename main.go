@@ -249,12 +249,13 @@ type adapter struct {
 	dir    string // $KAMI_HOME/adapters
 
 	chatKekkai, chatWorkflow string
-	coworkers                bool            // answer people other than the owner (feature flag)
-	replyAnswers             bool            // a thread reply answers its open contract; off: it goes to chat
-	mrWorkflow               string          // started on a coworker's review/approve tap
-	banterWorkflow           string          // started for anything else a coworker (or the owner, in a channel) says
-	recent                   map[string]bool // channel/ts already handled: a mention arrives as two events
-	im                       string          // the owner's DM channel, opened once
+	coworkers                bool              // answer people other than the owner (feature flag)
+	replyAnswers             bool              // a thread reply answers its open contract; off: it goes to chat
+	mrWorkflow               string            // started on a coworker's review/approve tap
+	banterWorkflow           string            // started for anything else a coworker (or the owner, in a channel) says
+	names                    map[string]string // Slack user id -> display name, for banter history
+	recent                   map[string]bool   // channel/ts already handled: a mention arrives as two events
+	im                       string            // the owner's DM channel, opened once
 	st                       state
 	run                      string          // $KAMI_RUN of a script step's dm/canvas, for the transcript
 	links                    map[string]link // run id -> its thread, once known

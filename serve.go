@@ -679,8 +679,13 @@ func (a *adapter) replies(ctx context.Context, threadTS string) ([]slack.Message
 	if err != nil {
 		return nil, err
 	}
+	return a.repliesIn(ctx, im, threadTS)
+}
+
+// repliesIn is a thread of any channel, oldest first, every page.
+func (a *adapter) repliesIn(ctx context.Context, channel, threadTS string) ([]slack.Message, error) {
 	var out []slack.Message
-	p := &slack.GetConversationRepliesParameters{ChannelID: im, Timestamp: threadTS, Limit: 200}
+	p := &slack.GetConversationRepliesParameters{ChannelID: channel, Timestamp: threadTS, Limit: 200}
 	for {
 		msgs, more, cursor, err := a.api.GetConversationRepliesContext(ctx, p)
 		if err != nil {

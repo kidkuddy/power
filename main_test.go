@@ -192,6 +192,8 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if to < len(msgs) {
 			out["response_metadata"] = map[string]any{"next_cursor": strconv.Itoa(to)}
 		}
+	case "users.info":
+		out = map[string]any{"user": map[string]any{"id": r.Form.Get("user"), "profile": map[string]any{"display_name": "name-" + r.Form.Get("user")}}}
 	case "files.getUploadURLExternal":
 		out = map[string]any{"upload_url": "http://" + r.Host + "/upload", "file_id": "FPIC"}
 	case "upload":
@@ -983,6 +985,15 @@ func TestCoworkers(t *testing.T) {
 	}
 	if in := k.started[2]["inputs"].(map[string]any); in["owner"] != true || in["channel"] != "C1" || in["text"] != "<@UPOWER> you there?" {
 		t.Fatalf("owner banter = %v", k.started[2])
+	}
+
+	// a thread reply carries the thread so far, with names, without the message itself
+	s.replies["30.1"] = []map[string]any{{"ts": "30.1", "user": "UBOB", "text": "ship it?"},
+		{"ts": "30.2", "bot_id": "B1", "text": "never"}, {"ts": "30.3", "user": owner, "text": "<@UPOWER> be nice"}}
+	must(a.onCoworker(ctx, coMsg{owner, "<@UPOWER> be nice", "C1", "30.3", "30.1"}))
+	if in := k.started[len(k.started)-1]["inputs"].(map[string]any); in["history"] != "name-UBOB: ship it?\nPOWER (you): never" ||
+		in["name"] != "name-"+owner+" (owner)" {
+		t.Fatalf("history = %q name %q", in["history"], in["name"])
 	}
 
 	// past the daily cap: a canned line, no Claude; the owner is never capped
