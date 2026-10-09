@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/slack-go/slack"
@@ -50,6 +52,9 @@ func (a *adapter) fresh(channel, ts string) bool {
 func (a *adapter) onCoworker(ctx context.Context, m coMsg) error {
 	if !a.fresh(m.channel, m.ts) {
 		return nil
+	}
+	if m.chType != "im" && !a.addressed(ctx, m) {
+		return nil // channel chatter she is not part of: not even a log line
 	}
 	a.record(entry{Dir: "in", Kind: "coworker", Channel: m.channel, TS: m.ts, ThreadTS: m.thread, User: m.user, Text: m.text})
 	root := m.thread
@@ -163,4 +168,24 @@ func (a *adapter) name(ctx context.Context, user string) string {
 	}
 	a.names[user] = n
 	return n
+}
+
+// addressed reports whether a channel message is for POWER: it mentions her,
+// or its conversation already has her session in it. Everything else in a
+// busy channel would otherwise cost a Claude turn each.
+func (a *adapter) addressed(ctx context.Context, m coMsg) bool {
+	if a.botUser != "" && strings.Contains(m.text, "<@"+a.botUser+">") {
+		return true
+	}
+	key, _, _, _ := a.convOf(m)
+	if len(a.st.Convs[key]) > 0 {
+		return true
+	}
+	var runs []struct{}
+	v := url.Values{"status": {"active"}, "kekkai": {a.chatKekkai}, "var": {"key=" + key}}
+	if err := a.kamiCall("GET", "/runs?"+v.Encode(), nil, &runs); err != nil {
+		a.logErr(err)
+		return false
+	}
+	return len(runs) > 0
 }

@@ -265,6 +265,7 @@ type adapter struct {
 	replyAnswers             bool              // a thread reply answers its open contract; off: it goes to chat
 	mrWorkflow               string            // started on a coworker's review/approve tap
 	convWorkflow             string            // one session per conversation with coworkers, or with the owner in a channel
+	botUser                  string            // POWER's own Slack user id, to tell when she is mentioned
 	names                    map[string]string // Slack user id -> display name, for conversation history
 	recent                   map[string]bool   // channel/ts already handled: a mention arrives as two events
 	im                       string            // the owner's DM channel, opened once

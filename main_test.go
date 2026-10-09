@@ -956,7 +956,7 @@ func TestCoworkers(t *testing.T) {
 	ctx := context.Background()
 	k, s, start := setup(t)
 	a := start()
-	a.coworkers, a.mrWorkflow, a.convWorkflow = true, "mr", "converse"
+	a.coworkers, a.mrWorkflow, a.convWorkflow, a.botUser = true, "mr", "converse", "UPOWER"
 	must := func(err error) {
 		t.Helper()
 		if err != nil {
@@ -1035,12 +1035,19 @@ func TestCoworkers(t *testing.T) {
 		t.Fatalf("drain = %v queue %v", last, a.st.Convs)
 	}
 
+	// channel chatter that neither mentions her nor is in a conversation she is in: ignored
+	n0 := len(k.started)
+	must(a.onMessage(ctx, ch("UBOB", "40.1", "lunch anyone?")))
+	if len(k.started) != n0 || len(a.st.Convs) != 0 {
+		t.Fatalf("chatter routed: started %d→%d", n0, len(k.started))
+	}
+
 	// past the daily cap: a canned line, no Claude; the owner is never capped
 	for i := 0; i < banterPerDay; i++ {
-		must(a.onMessage(ctx, ch("UEVE", fmt.Sprintf("20.%d", i), "spam")))
+		must(a.onMessage(ctx, ch("UEVE", fmt.Sprintf("20.%d", i), "<@UPOWER> spam")))
 	}
 	n := len(k.started)
-	must(a.onMessage(ctx, ch("UEVE", "21.1", "spam")))
+	must(a.onMessage(ctx, ch("UEVE", "21.1", "<@UPOWER> spam")))
 	if p := s.of("chat.postMessage"); len(k.started) != n || p[len(p)-1].Get("text") != "i only answer to the owner, bruh" {
 		t.Fatalf("cap: started %d→%d, last %v", n, len(k.started), p[len(p)-1])
 	}

@@ -32,6 +32,11 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 	if err := a.load(); err != nil {
 		return err
 	}
+	if id, err := a.api.AuthTestContext(ctx); err == nil {
+		a.botUser = id.UserID
+	} else {
+		log.Printf("kami-slack: auth.test: %v (channel mentions will not be recognised)", err)
+	}
 	sm := socketmode.New(a.api)
 	errc := make(chan error, 1)
 	go func() { errc <- sm.RunContext(ctx) }()
