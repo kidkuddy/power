@@ -33,11 +33,13 @@ const usage = `kami-slack — Kami's Slack surface (niffty's Slack app)
 
   kami-slack serve [--poll 5s] [--kekkai K]     contracts → owner DMs; buttons and thread replies resolve them;
                    [--chat-kekkai work] [--chat-workflow chat]   other owner DMs go to a chat run
-                   [--coworkers=true] [--mr-workflow mr] [--banter-workflow banter]   anyone else (and you, in
-                                                channels): an MR link gets review/approve buttons, anything else a one-liner
+                   [--coworkers=true] [--mr-workflow mr] [--conv-workflow converse]   anyone else (and you, in
+                                                channels): an MR link gets review/approve buttons, anything else that conversation's session
   kami-slack dm [--channel C] [--thread TS] [<text>...]   DM the owner, or post to C (text on stdin when no args); prints {"channel","ts"}
   kami-slack answer [--data JSON] <contract> <answer...>   answer a contract as the owner, from POWER's chat
                                                 (refuses 🔒 contracts: those take a button press)
+  kami-slack react [--channel C] <ts> <emoji>    add an emoji reaction (owner DM by default)
+  kami-slack upload [--channel C] [--thread TS] <file>   post an image or file
   kami-slack pin [--off] [--channel C] <ts>     pin (or unpin) a message, the owner DM by default
   kami-slack wrap <thread ts>                    unpin a chat thread and the status cards in it
   kami-slack canvas [--key <slug>] [--users U1,U2] <title>   markdown on stdin → private canvas shared with the owner (and users); prints its URL
@@ -77,7 +79,7 @@ func main() {
 	replyAnswers := fs.Bool("reply-answers", false, "serve: a thread reply answers its open contract directly instead of going to chat")
 	coworkers := fs.Bool("coworkers", true, "serve: answer other people (DMs, mentions, channels POWER is in)")
 	mrWf := fs.String("mr-workflow", "mr", "serve: workflow (in --chat-kekkai) a coworker's review/approve tap starts")
-	banterWf := fs.String("banter-workflow", "banter", "serve: workflow (in --chat-kekkai) that answers anything else in one line")
+	convWf := fs.String("conv-workflow", "converse", "serve: workflow (in --chat-kekkai) holding one Claude session per DM, channel or channel thread")
 	canvasUsers := fs.String("users", "", "canvas: extra Slack user ids (comma-separated) who may open it")
 	fs.Parse(args)
 	rest := fs.Args()
@@ -116,17 +118,17 @@ func main() {
 		log.Fatalf("kami-slack: SLACK_BOT_TOKEN and NIFFTY_OWNER_ID must be set in %s", *envPath)
 	}
 	a := &adapter{
-		api:            slack.New(env["SLACK_BOT_TOKEN"], slack.OptionAppLevelToken(env["SLACK_APP_TOKEN"])),
-		kami:           kamiClient(*sock),
-		owner:          env["NIFFTY_OWNER_ID"],
-		kekkai:         *kek,
-		chatKekkai:     *chatKek,
-		chatWorkflow:   *chatWf,
-		coworkers:      *coworkers,
-		replyAnswers:   *replyAnswers,
-		mrWorkflow:     *mrWf,
-		banterWorkflow: *banterWf,
-		dir:            dir,
+		api:          slack.New(env["SLACK_BOT_TOKEN"], slack.OptionAppLevelToken(env["SLACK_APP_TOKEN"])),
+		kami:         kamiClient(*sock),
+		owner:        env["NIFFTY_OWNER_ID"],
+		kekkai:       *kek,
+		chatKekkai:   *chatKek,
+		chatWorkflow: *chatWf,
+		coworkers:    *coworkers,
+		replyAnswers: *replyAnswers,
+		mrWorkflow:   *mrWf,
+		convWorkflow: *convWf,
+		dir:          dir,
 	}
 	if cmd != "serve" {
 		a.run = os.Getenv("KAMI_RUN") // set for a workflow script step
@@ -181,6 +183,16 @@ func main() {
 			log.Fatal("kami-slack wrap: one thread ts is required")
 		}
 		err = a.wrap(ctx, fs.Arg(0))
+	case "react":
+		if fs.NArg() != 2 {
+			log.Fatal("kami-slack react: a message ts and an emoji name are required")
+		}
+		err = a.react(ctx, *channel, fs.Arg(0), strings.Trim(fs.Arg(1), ":"))
+	case "upload":
+		if fs.NArg() != 1 {
+			log.Fatal("kami-slack upload: one file is required")
+		}
+		err = a.upload(ctx, *channel, *thread, fs.Arg(0))
 	case "pin":
 		if fs.NArg() != 1 {
 			log.Fatal("kami-slack pin: one message ts is required")
@@ -252,8 +264,8 @@ type adapter struct {
 	coworkers                bool              // answer people other than the owner (feature flag)
 	replyAnswers             bool              // a thread reply answers its open contract; off: it goes to chat
 	mrWorkflow               string            // started on a coworker's review/approve tap
-	banterWorkflow           string            // started for anything else a coworker (or the owner, in a channel) says
-	names                    map[string]string // Slack user id -> display name, for banter history
+	convWorkflow             string            // one session per conversation with coworkers, or with the owner in a channel
+	names                    map[string]string // Slack user id -> display name, for conversation history
 	recent                   map[string]bool   // channel/ts already handled: a mention arrives as two events
 	im                       string            // the owner's DM channel, opened once
 	st                       state
@@ -291,6 +303,48 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 	}
 	a.record(e)
 	return e.Channel, e.TS, nil
+}
+
+// react adds an emoji reaction; already reacted counts as done.
+func (a *adapter) react(ctx context.Context, channel, ts, emoji string) error {
+	var err error
+	if channel == "" {
+		channel, err = a.dm(ctx)
+	}
+	e := entry{Dir: "out", Kind: "reaction", Channel: channel, TS: ts, Text: emoji}
+	if err == nil {
+		err = a.api.AddReactionContext(ctx, emoji, slack.NewRefToMessage(channel, ts))
+		var se slack.SlackErrorResponse
+		if errors.As(err, &se) && se.Err == "already_reacted" {
+			err = nil
+		}
+	}
+	if err != nil {
+		e.Kind, e.Error = "error", "react: "+err.Error()
+	}
+	a.record(e)
+	return err
+}
+
+// upload posts a file into a channel (the owner DM by default), threaded when set.
+func (a *adapter) upload(ctx context.Context, channel, thread, path string) error {
+	var err error
+	if channel == "" {
+		channel, err = a.dm(ctx)
+	}
+	e := entry{Dir: "out", Kind: "picture", Channel: channel, ThreadTS: thread, Text: path}
+	if err == nil {
+		var fi os.FileInfo
+		if fi, err = os.Stat(path); err == nil {
+			_, err = a.api.UploadFileContext(ctx, slack.UploadFileParameters{File: path, FileSize: int(fi.Size()),
+				Filename: filepath.Base(path), Channel: channel, ThreadTimestamp: thread})
+		}
+	}
+	if err != nil {
+		e.Kind, e.Error = "error", "upload: "+err.Error()
+	}
+	a.record(e)
+	return err
 }
 
 // pin pins or unpins a message. Already pinned / not pinned counts as done.
@@ -453,12 +507,13 @@ func (a *adapter) kamiCall(method, path string, body, out any) error {
 // --- state ---------------------------------------------------------------------
 
 type state struct {
-	Since   int64               `json:"since"`            // last kami event handled
-	Threads map[string]*thread  `json:"threads"`          // contract id -> its DM
-	Queue   map[string][]queued `json:"queue,omitempty"`  // chat thread key -> messages not yet handed to kami
-	Cards   map[string]*card    `json:"cards,omitempty"`  // top-level run id -> its status card
-	Day     string              `json:"day,omitempty"`    // the local day Banter counts
-	Banter  map[string]int      `json:"banter,omitempty"` // coworker -> one-liners asked for on Day
+	Since   int64                `json:"since"`            // last kami event handled
+	Threads map[string]*thread   `json:"threads"`          // contract id -> its DM
+	Queue   map[string][]queued  `json:"queue,omitempty"`  // chat thread key -> messages not yet handed to kami
+	Cards   map[string]*card     `json:"cards,omitempty"`  // top-level run id -> its status card
+	Day     string               `json:"day,omitempty"`    // the local day Banter counts
+	Banter  map[string]int       `json:"banter,omitempty"` // coworker -> messages handed to a session on Day
+	Convs   map[string][]convMsg `json:"convs,omitempty"`  // conversation key -> messages waiting while its session is busy
 }
 
 type queued struct {
@@ -480,7 +535,7 @@ type thread struct {
 func (a *adapter) statePath() string { return filepath.Join(a.dir, "slack.json") }
 
 func (a *adapter) load() error {
-	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}}
+	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}, Convs: map[string][]convMsg{}}
 	raw, err := os.ReadFile(a.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -502,6 +557,9 @@ func (a *adapter) load() error {
 	}
 	if a.st.Banter == nil {
 		a.st.Banter = map[string]int{}
+	}
+	if a.st.Convs == nil {
+		a.st.Convs = map[string][]convMsg{}
 	}
 	return nil
 }

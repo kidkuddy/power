@@ -84,6 +84,9 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		if ok && q.Get("status") == "active" && q.Get("kekkai") == "work" && k.busy[key] {
 			runs = append(runs, map[string]any{"id": "run-" + key, "workflow": "chat", "status": "running"})
 		}
+		if ck, isConv := strings.CutPrefix(q.Get("var"), "key="); isConv && q.Get("status") == "active" && k.busy[ck] {
+			runs = append(runs, map[string]any{"id": "run-" + ck, "workflow": "converse", "status": "running"})
+		}
 		if ok && q.Get("status") == "" {
 			for id, run := range k.runs {
 				if vars, _ := run["vars"].(map[string]any); vars["thread_ts"] == key {
@@ -107,7 +110,7 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		defer k.mu.Unlock()
 		var req map[string]any
 		json.NewDecoder(r.Body).Decode(&req)
-		if req["workflow"] != "chat" && req["workflow"] != "mr" && req["workflow"] != "banter" {
+		if req["workflow"] != "chat" && req["workflow"] != "mr" && req["workflow"] != "converse" {
 			env(w, nil, "NOT_FOUND", fmt.Sprintf("no workflow %q in kekkai work", req["workflow"]))
 			return
 		}
@@ -872,6 +875,13 @@ func TestRunThreads(t *testing.T) {
 		t.Fatalf("follow-up = %v", l)
 	}
 
+	// a card read back from the state file (children omitted while empty) still takes a child line
+	a.save()
+	a = start()
+	a.st.Cards["rp"].Children = nil
+	must(a.onCard(ctx, "rp", link{thread: "700.1", workflow: "build", root: "rp"},
+		eventbus.Event{Run: "rz", Type: "run.started"}, "late", "↳ POWER started late"))
+
 	// an AFK answer in rp's tree goes on rp's card, not into a message of its own
 	n := len(s.of("chat.postMessage"))
 	k.mu.Lock()
@@ -946,7 +956,7 @@ func TestCoworkers(t *testing.T) {
 	ctx := context.Background()
 	k, s, start := setup(t)
 	a := start()
-	a.coworkers, a.mrWorkflow, a.banterWorkflow = true, "mr", "banter"
+	a.coworkers, a.mrWorkflow, a.convWorkflow = true, "mr", "converse"
 	must := func(err error) {
 		t.Helper()
 		if err != nil {
@@ -960,7 +970,7 @@ func TestCoworkers(t *testing.T) {
 	// an MR link in a channel: one question with two buttons in its thread; the app_mention twin is dropped
 	link := "<https://gitlab.com/acme/web/-/merge_requests/42|!42>"
 	must(a.onMessage(ctx, ch("UBOB", "10.1", "<@UPOWER> look "+link)))
-	must(a.onCoworker(ctx, coMsg{"UBOB", "look " + link, "C1", "10.1", ""}))
+	must(a.onCoworker(ctx, coMsg{"UBOB", "look " + link, "C1", "10.1", "", "channel"}))
 	posts := s.of("chat.postMessage")
 	if len(posts) != 1 || posts[0].Get("channel") != "C1" || posts[0].Get("thread_ts") != "10.1" ||
 		!strings.Contains(posts[0].Get("blocks"), "power:review") || !strings.Contains(posts[0].Get("blocks"), "power:approve") {
@@ -985,26 +995,44 @@ func TestCoworkers(t *testing.T) {
 		t.Fatalf("redraw = %v", u)
 	}
 
-	// anything else: a banter run, owner flagged; a non-owner DM counts too
+	// anything else goes to its conversation's session: a DM with a coworker…
 	must(a.onMessage(ctx, reply("UBOB", "", "11.1", "hi")))
+	in := k.started[1]["inputs"].(map[string]any)
+	if k.started[1]["workflow"] != "converse" || in["kami_conv"] != "dm" || in["kami_peer"] != "UBOB" || in["key"] != "dm:D1" ||
+		in["reply_ts"] != "" || in["owner_msg"] != false || in["from_name"] != "name-UBOB" || !strings.Contains(in["place"].(string), "DM") {
+		t.Fatalf("dm session = %v", k.started[1])
+	}
+	// …a channel's main conversation (the owner, here)…
 	must(a.onMessage(ctx, ch(owner, "12.1", "<@UPOWER> you there?")))
-	if len(k.started) != 3 {
-		t.Fatalf("started = %v", k.started)
+	in = k.started[2]["inputs"].(map[string]any)
+	if in["kami_conv"] != "group" || in["key"] != "chan:C1" || in["owner_msg"] != true || in["kami_peer"] != nil || in["text"] != "<@UPOWER> you there?" {
+		t.Fatalf("channel session = %v", k.started[2])
 	}
-	if in := k.started[1]["inputs"].(map[string]any); k.started[1]["workflow"] != "banter" || in["owner"] != false || in["channel"] != "D1" || in["reply_ts"] != "11.1" {
-		t.Fatalf("banter = %v", k.started[1])
-	}
-	if in := k.started[2]["inputs"].(map[string]any); in["owner"] != true || in["channel"] != "C1" || in["text"] != "<@UPOWER> you there?" {
-		t.Fatalf("owner banter = %v", k.started[2])
-	}
-
-	// a thread reply carries the thread so far, with names, without the message itself
+	// …and a channel thread, which carries the thread so far with names
 	s.replies["30.1"] = []map[string]any{{"ts": "30.1", "user": "UBOB", "text": "ship it?"},
 		{"ts": "30.2", "bot_id": "B1", "text": "never"}, {"ts": "30.3", "user": owner, "text": "<@UPOWER> be nice"}}
-	must(a.onCoworker(ctx, coMsg{owner, "<@UPOWER> be nice", "C1", "30.3", "30.1"}))
-	if in := k.started[len(k.started)-1]["inputs"].(map[string]any); in["history"] != "name-UBOB: ship it?\nPOWER (you): never" ||
-		in["name"] != "name-"+owner+" (owner)" {
-		t.Fatalf("history = %q name %q", in["history"], in["name"])
+	must(a.onCoworker(ctx, coMsg{owner, "<@UPOWER> be nice", "C1", "30.3", "30.1", "channel"}))
+	in = k.started[3]["inputs"].(map[string]any)
+	if in["key"] != "thr:C1:30.1" || in["reply_ts"] != "30.1" || in["history"] != "name-UBOB: ship it?\nPOWER (you): never" {
+		t.Fatalf("thread session = %v", in)
+	}
+	// a waiting session gets the next message as a signal; a busy one queues it, then one labeled turn
+	k.waiting["dm:D1"] = true
+	must(a.onMessage(ctx, reply("UBOB", "", "11.2", "again")))
+	if last := k.signals[len(k.signals)-1]; last["key"] != "dm:D1" || last["data"].(map[string]any)["text"] != "again" || len(k.started) != 4 {
+		t.Fatalf("signal = %v started %d", last, len(k.started))
+	}
+	k.busy["dm:D1"] = true
+	must(a.onMessage(ctx, reply("UBOB", "", "11.3", "one")))
+	must(a.onMessage(ctx, reply("UBOB", "", "11.4", "two")))
+	if len(a.st.Convs["dm:D1"]) != 2 || len(k.started) != 4 {
+		t.Fatalf("busy: queue %v started %d", a.st.Convs["dm:D1"], len(k.started))
+	}
+	delete(k.busy, "dm:D1")
+	k.waiting["dm:D1"] = true
+	a.routeConvs(ctx)
+	if last := k.signals[len(k.signals)-1]; last["data"].(map[string]any)["text"] != "name-UBOB: one\nname-UBOB: two" || len(a.st.Convs) != 0 {
+		t.Fatalf("drain = %v queue %v", last, a.st.Convs)
 	}
 
 	// past the daily cap: a canned line, no Claude; the owner is never capped

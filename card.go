@@ -46,7 +46,10 @@ func (c *card) text() string {
 func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev eventbus.Event, workflow, text string) error {
 	c := a.st.Cards[rootID]
 	if c == nil {
-		c = &card{Thread: root.thread, Title: fmt.Sprintf("%s `%s`", root.workflow, rootID), Status: "running", Children: map[string]int{}}
+		c = &card{Thread: root.thread, Title: fmt.Sprintf("%s `%s`", root.workflow, rootID), Status: "running"}
+	}
+	if c.Children == nil { // omitted from the state file while it was empty
+		c.Children = map[string]int{}
 	}
 	switch {
 	case ev.Run == rootID && ev.Type == "run.finished":

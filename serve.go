@@ -46,6 +46,7 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 		case <-t.C:
 			a.logErr(a.events(ctx))
 			a.routeAll(ctx)
+			a.routeConvs(ctx)
 		case evt := <-sm.Events:
 			switch evt.Type {
 			case socketmode.EventTypeConnected:
@@ -61,7 +62,7 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 					a.logErr(a.onMessage(ctx, m))
 				case *slackevents.AppMentionEvent:
 					if m.BotID == "" && m.User != "" && a.coworkers {
-						a.logErr(a.onCoworker(ctx, coMsg{m.User, m.Text, m.Channel, m.TimeStamp, m.ThreadTimeStamp}))
+						a.logErr(a.onCoworker(ctx, coMsg{m.User, m.Text, m.Channel, m.TimeStamp, m.ThreadTimeStamp, "channel"}))
 					}
 				}
 			case socketmode.EventTypeInteractive:
@@ -452,7 +453,7 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		if m.SubType != "" && m.SubType != "thread_broadcast" && m.SubType != "file_share" {
 			return nil // joins, edits, deletions
 		}
-		return a.onCoworker(ctx, coMsg{m.User, m.Text, m.Channel, m.TimeStamp, m.ThreadTimeStamp})
+		return a.onCoworker(ctx, coMsg{m.User, m.Text, m.Channel, m.TimeStamp, m.ThreadTimeStamp, m.ChannelType})
 	}
 	if m.ChannelType != "im" {
 		return nil
