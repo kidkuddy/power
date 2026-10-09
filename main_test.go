@@ -123,7 +123,7 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		out := []engine.ContractView{}
 		for _, c := range k.contracts {
 			if c.RunID == r.URL.Query().Get("run") && c.Status == "open" {
-				out = append(out, engine.ContractView{Contract: c})
+				out = append(out, engine.ContractView{Contract: c, Workflow: "chat"})
 			}
 		}
 		env(w, out, "", "")
@@ -472,12 +472,17 @@ func TestChat(t *testing.T) {
 		t.Fatalf("busy: queue %v started %d", q, len(k.started))
 	}
 	// parked on its own question (wrap up?): the new message answers it with the last option
-	k.contracts["cw1"] = &engine.Contract{ID: "cw1", RunID: "run-300.1", Origin: "state", Kind: "choice", Title: "Wrap up?",
+	k.contracts["cw1"] = &engine.Contract{ID: "cw1", RunID: "run-300.1", Origin: "state", Step: "confirm_wrap", Kind: "choice", Title: "Wrap up?",
 		Options: []string{"unpin_and_wrap", "keep_going"}, Status: "open"}
+	// …but never a question the worker raised itself, whatever its options
+	k.contracts["cx1"] = &engine.Contract{ID: "cx1", RunID: "run-300.1", Origin: "worker", Kind: "choice", Title: "Push?",
+		Options: []string{"no", "yes, push"}, Status: "open"}
+	n := len(k.resolves)
 	a.routeAll(ctx)
-	if last := k.resolves[len(k.resolves)-1]; last != "cw1=keep_going map[]" {
-		t.Fatalf("superseded = %v", k.resolves)
+	if got := k.resolves[n:]; len(got) != 1 || got[0] != "cw1=keep_going map[]" {
+		t.Fatalf("superseded = %v", got)
 	}
+	delete(k.contracts, "cx1")
 	a = start() // the queue survives a restart
 	k.waiting["300.1"] = true
 	a.routeAll(ctx)

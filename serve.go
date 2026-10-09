@@ -591,8 +591,8 @@ func (a *adapter) route(ctx context.Context, key string) error {
 	}
 	for _, r := range runs {
 		if r.Workflow == a.chatWorkflow {
-			// parked on its own question (start? wrap up? post?): the owner moved on, so take the
-			// last answer, which in chat always means "don't", and the message gets through next tick
+			// parked on its own question (start? wrap up? post?): the owner moved on, so answer
+			// "don't", and the message gets through next tick
 			return a.supersede(r.ID)
 		}
 	}
@@ -687,19 +687,25 @@ func (a *adapter) threadContracts(key string) string {
 	return strings.Join(ids, ",")
 }
 
-// supersede answers a chat run's open question with its last option when the
-// owner writes instead of tapping; a chat run that is busy thinking has none.
+// chatDont is, for each question the chat workflow itself asks, the answer
+// that does nothing. Only these are ever answered for the owner: a question a
+// worker raised (kami contract request) picks its own options and stays his.
+var chatDont = map[string]string{"confirm": "cancel", "confirm_wrap": "keep_going", "confirm_post": "cancel"}
+
+// supersede answers a chat run's parked question with "don't" when the owner
+// writes instead of tapping; a chat run that is busy thinking has none.
 func (a *adapter) supersede(runID string) error {
 	var open []engine.ContractView
 	if err := a.kamiCall("GET", "/contracts?"+url.Values{"status": {"open"}, "run": {runID}}.Encode(), nil, &open); err != nil {
 		return err
 	}
 	for _, c := range open {
-		if len(c.Options) == 0 {
+		ans, ok := chatDont[c.Step]
+		if !ok || c.Origin != "state" || c.Workflow != a.chatWorkflow || !contains(c.Options, ans) {
 			continue
 		}
 		err := a.kamiCall("POST", "/contracts/"+url.PathEscape(c.ID)+"/resolve",
-			map[string]any{"answer": c.Options[len(c.Options)-1], "note": "superseded: the owner wrote a new message instead"}, nil)
+			map[string]any{"answer": ans, "note": "superseded: the owner wrote a new message instead"}, nil)
 		var ke *kamiErr
 		if err != nil && !errors.As(err, &ke) {
 			return err
