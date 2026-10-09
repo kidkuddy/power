@@ -582,6 +582,7 @@ func (a *adapter) route(ctx context.Context, key string) error {
 		return a.save()
 	}
 	var runs []struct {
+		ID       string `json:"id"`
 		Workflow string `json:"workflow"`
 	}
 	v := url.Values{"status": {"active"}, "kekkai": {a.chatKekkai}, "var": {"thread_ts=" + key}}
@@ -590,7 +591,9 @@ func (a *adapter) route(ctx context.Context, key string) error {
 	}
 	for _, r := range runs {
 		if r.Workflow == a.chatWorkflow {
-			return nil // busy: stays queued
+			// parked on its own question (start? wrap up? post?): the owner moved on, so take the
+			// last answer, which in chat always means "don't", and the message gets through next tick
+			return a.supersede(r.ID)
 		}
 	}
 	var texts []string
@@ -682,6 +685,27 @@ func (a *adapter) threadContracts(key string) string {
 	}
 	sort.Strings(ids)
 	return strings.Join(ids, ",")
+}
+
+// supersede answers a chat run's open question with its last option when the
+// owner writes instead of tapping; a chat run that is busy thinking has none.
+func (a *adapter) supersede(runID string) error {
+	var open []engine.ContractView
+	if err := a.kamiCall("GET", "/contracts?"+url.Values{"status": {"open"}, "run": {runID}}.Encode(), nil, &open); err != nil {
+		return err
+	}
+	for _, c := range open {
+		if len(c.Options) == 0 {
+			continue
+		}
+		err := a.kamiCall("POST", "/contracts/"+url.PathEscape(c.ID)+"/resolve",
+			map[string]any{"answer": c.Options[len(c.Options)-1], "note": "superseded: the owner wrote a new message instead"}, nil)
+		var ke *kamiErr
+		if err != nil && !errors.As(err, &ke) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *adapter) pop(key string, n int) {

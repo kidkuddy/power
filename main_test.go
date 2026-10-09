@@ -117,6 +117,17 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		k.started = append(k.started, req)
 		env(w, map[string]any{"id": "run-new"}, "", "")
 	})
+	m.HandleFunc("GET /contracts", func(w http.ResponseWriter, r *http.Request) {
+		k.mu.Lock()
+		defer k.mu.Unlock()
+		out := []engine.ContractView{}
+		for _, c := range k.contracts {
+			if c.RunID == r.URL.Query().Get("run") && c.Status == "open" {
+				out = append(out, engine.ContractView{Contract: c})
+			}
+		}
+		env(w, out, "", "")
+	})
 	m.HandleFunc("GET /contracts/{id}", func(w http.ResponseWriter, r *http.Request) {
 		k.mu.Lock()
 		defer k.mu.Unlock()
@@ -459,6 +470,13 @@ func TestChat(t *testing.T) {
 	must(a.onMessage(ctx, reply(owner, "300.1", "300.4", "two")))
 	if q := a.st.Queue["300.1"]; len(q) != 2 || q[0].Text != "one" || q[1].Text != "two" || len(k.started) != 1 {
 		t.Fatalf("busy: queue %v started %d", q, len(k.started))
+	}
+	// parked on its own question (wrap up?): the new message answers it with the last option
+	k.contracts["cw1"] = &engine.Contract{ID: "cw1", RunID: "run-300.1", Origin: "state", Kind: "choice", Title: "Wrap up?",
+		Options: []string{"unpin_and_wrap", "keep_going"}, Status: "open"}
+	a.routeAll(ctx)
+	if last := k.resolves[len(k.resolves)-1]; last != "cw1=keep_going map[]" {
+		t.Fatalf("superseded = %v", k.resolves)
 	}
 	a = start() // the queue survives a restart
 	k.waiting["300.1"] = true
