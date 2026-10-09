@@ -107,7 +107,7 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		defer k.mu.Unlock()
 		var req map[string]any
 		json.NewDecoder(r.Body).Decode(&req)
-		if req["workflow"] != "chat" && req["workflow"] != "mr" {
+		if req["workflow"] != "chat" && req["workflow"] != "mr" && req["workflow"] != "banter" {
 			env(w, nil, "NOT_FOUND", fmt.Sprintf("no workflow %q in kekkai work", req["workflow"]))
 			return
 		}
@@ -933,10 +933,7 @@ func TestCoworkers(t *testing.T) {
 	ctx := context.Background()
 	k, s, start := setup(t)
 	a := start()
-	a.coworkers, a.mrWorkflow = true, "mr"
-	a.picture = filepath.Join(a.dir, "power.gif")
-	os.MkdirAll(a.dir, 0o700)
-	os.WriteFile(a.picture, []byte("GIF89a"), 0o600)
+	a.coworkers, a.mrWorkflow, a.banterWorkflow = true, "mr", "banter"
 	must := func(err error) {
 		t.Helper()
 		if err != nil {
@@ -975,25 +972,23 @@ func TestCoworkers(t *testing.T) {
 		t.Fatalf("redraw = %v", u)
 	}
 
-	// anything else: the picture once a day, then "no :)"; a non-owner DM counts too
+	// anything else: a banter run, owner flagged; a non-owner DM counts too
 	must(a.onMessage(ctx, reply("UBOB", "", "11.1", "hi")))
-	must(a.onMessage(ctx, ch("UBOB", "12.1", "hello?")))
-	if up := s.of("files.completeUploadExternal"); len(up) != 1 || up[0].Get("channel_id") != "D1" || up[0].Get("thread_ts") != "11.1" {
-		t.Fatalf("uploads = %v", up)
+	must(a.onMessage(ctx, ch(owner, "12.1", "<@UPOWER> you there?")))
+	if len(k.started) != 3 {
+		t.Fatalf("started = %v", k.started)
 	}
-	if p := s.of("chat.postMessage"); len(p) != 2 || p[1].Get("text") != "no :)" || p[1].Get("thread_ts") != "12.1" {
-		t.Fatalf("posts = %v", p)
+	if in := k.started[1]["inputs"].(map[string]any); k.started[1]["workflow"] != "banter" || in["owner"] != false || in["channel"] != "D1" || in["reply_ts"] != "11.1" {
+		t.Fatalf("banter = %v", k.started[1])
 	}
-	must(a.onMessage(ctx, ch("UBOB", "12.2", "please")))
-	must(a.onMessage(ctx, ch("UBOB", "12.3", "pretty please")))
-	if p := s.of("chat.postMessage"); len(p) != 4 || p[2].Get("text") != "no :)" || p[3].Get("text") != "i only answer to the owner, bruh" {
-		t.Fatalf("posts = %v", p)
+	if in := k.started[2]["inputs"].(map[string]any); in["owner"] != true || in["channel"] != "C1" || in["text"] != "<@UPOWER> you there?" {
+		t.Fatalf("owner banter = %v", k.started[2])
 	}
 
-	// off: a non-owner DM is ignored again, the owner's DM still goes to chat
+	// off: a non-owner DM is ignored again
 	a.coworkers = false
 	must(a.onMessage(ctx, reply("UBOB", "", "13.1", "hi")))
-	if len(s.of("chat.postMessage")) != 4 || len(s.of("files.completeUploadExternal")) != 1 {
+	if len(k.started) != 3 {
 		t.Fatal("coworker answered with the flag off")
 	}
 }

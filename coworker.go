@@ -5,18 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
-	"time"
 
 	"github.com/slack-go/slack"
 )
 
 // Coworkers: anyone but the owner in a DM, and anyone at all in a channel.
 // A GitLab MR link gets review / just-approve buttons; the tapper's choice
-// starts --mr-workflow. Anything else, per person per day: the picture,
-// "no :)" twice, then "i only answer to the owner, bruh".
+// starts --mr-workflow. Anything else gets a one-liner from --banter-workflow.
 
 // Only gitlab.com, the host glab acts on: a link to any other host must not
 // become an approval of the same path on gitlab.com. Same pattern as mr-open's MR_URL.
@@ -69,35 +65,25 @@ func (a *adapter) onCoworker(ctx context.Context, m coMsg) error {
 		_, _, err := a.post(ctx, out, blocks)
 		return err
 	}
-	today := time.Now().Format("2006-01-02")
-	if a.st.Seen[m.user] != today {
-		if err := a.sendPicture(ctx, m.channel, root); err != nil {
-			return err
-		}
-		a.st.Seen[m.user], a.st.Count[m.user] = today, 1
-		return a.save()
-	}
-	a.st.Count[m.user]++
-	out.Text = "no :)"
-	if a.st.Count[m.user] > 3 { // the picture, then two "no :)"
-		out.Text = "i only answer to the owner, bruh"
-	}
-	if err := a.save(); err != nil {
-		return err
-	}
-	_, _, err := a.post(ctx, out, nil)
-	return err
+	return a.banter(m)
 }
 
-func (a *adapter) sendPicture(ctx context.Context, channel, thread string) error {
-	e := entry{Dir: "out", Kind: "picture", Channel: channel, ThreadTS: thread, Text: a.picture}
-	fi, err := os.Stat(a.picture)
-	if err == nil {
-		_, err = a.api.UploadFileContext(ctx, slack.UploadFileParameters{File: a.picture, FileSize: int(fi.Size()),
-			Filename: filepath.Base(a.picture), Channel: channel, ThreadTimestamp: thread})
+// banter starts --banter-workflow: Claude with no tools writes POWER's one-liner
+// into the message's thread ("yes senpai" when it is the owner).
+func (a *adapter) banter(m coMsg) error {
+	root := m.thread
+	if root == "" {
+		root = m.ts
 	}
+	var run struct {
+		ID string `json:"id"`
+	}
+	err := a.kamiCall("POST", "/runs", map[string]any{"kekkai": a.chatKekkai, "workflow": a.banterWorkflow,
+		"inputs": map[string]any{"text": unslack(m.text), "user": m.user, "owner": m.user == a.owner, "channel": m.channel, "reply_ts": root}}, &run)
+	e := entry{Dir: "in", Kind: "chat_routed", Channel: m.channel, TS: m.ts, ThreadTS: root, User: m.user, Text: m.text,
+		Routed: "started", RunID: run.ID, Workflow: a.banterWorkflow}
 	if err != nil {
-		e.Kind, e.Error = "error", "picture: "+err.Error()
+		e.Error = err.Error()
 	}
 	a.record(e)
 	return err

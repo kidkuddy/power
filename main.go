@@ -33,8 +33,8 @@ const usage = `kami-slack — Kami's Slack surface (niffty's Slack app)
 
   kami-slack serve [--poll 5s] [--kekkai K]     contracts → owner DMs; buttons and thread replies resolve them;
                    [--chat-kekkai work] [--chat-workflow chat]   other owner DMs go to a chat run
-                   [--coworkers=true] [--mr-workflow mr] [--picture PATH]   anyone else: an MR link gets
-                                                review/approve buttons, anything else the picture (daily), then "no :)"
+                   [--coworkers=true] [--mr-workflow mr] [--banter-workflow banter]   anyone else (and you, in
+                                                channels): an MR link gets review/approve buttons, anything else a one-liner
   kami-slack dm [--channel C] [--thread TS] [<text>...]   DM the owner, or post to C (text on stdin when no args); prints {"channel","ts"}
   kami-slack answer [--data JSON] <contract> <answer...>   answer a contract as the owner, from POWER's chat
                                                 (refuses 🔒 contracts: those take a button press)
@@ -77,7 +77,7 @@ func main() {
 	replyAnswers := fs.Bool("reply-answers", false, "serve: a thread reply answers its open contract directly instead of going to chat")
 	coworkers := fs.Bool("coworkers", true, "serve: answer other people (DMs, mentions, channels POWER is in)")
 	mrWf := fs.String("mr-workflow", "mr", "serve: workflow (in --chat-kekkai) a coworker's review/approve tap starts")
-	picture := fs.String("picture", filepath.Join(kamiHome(), "adapters", "power.gif"), "serve: image sent to coworkers once a day")
+	banterWf := fs.String("banter-workflow", "banter", "serve: workflow (in --chat-kekkai) that answers anything else in one line")
 	canvasUsers := fs.String("users", "", "canvas: extra Slack user ids (comma-separated) who may open it")
 	fs.Parse(args)
 	rest := fs.Args()
@@ -116,17 +116,17 @@ func main() {
 		log.Fatalf("kami-slack: SLACK_BOT_TOKEN and NIFFTY_OWNER_ID must be set in %s", *envPath)
 	}
 	a := &adapter{
-		api:          slack.New(env["SLACK_BOT_TOKEN"], slack.OptionAppLevelToken(env["SLACK_APP_TOKEN"])),
-		kami:         kamiClient(*sock),
-		owner:        env["NIFFTY_OWNER_ID"],
-		kekkai:       *kek,
-		chatKekkai:   *chatKek,
-		chatWorkflow: *chatWf,
-		coworkers:    *coworkers,
-		replyAnswers: *replyAnswers,
-		mrWorkflow:   *mrWf,
-		picture:      *picture,
-		dir:          dir,
+		api:            slack.New(env["SLACK_BOT_TOKEN"], slack.OptionAppLevelToken(env["SLACK_APP_TOKEN"])),
+		kami:           kamiClient(*sock),
+		owner:          env["NIFFTY_OWNER_ID"],
+		kekkai:         *kek,
+		chatKekkai:     *chatKek,
+		chatWorkflow:   *chatWf,
+		coworkers:      *coworkers,
+		replyAnswers:   *replyAnswers,
+		mrWorkflow:     *mrWf,
+		banterWorkflow: *banterWf,
+		dir:            dir,
 	}
 	if cmd != "serve" {
 		a.run = os.Getenv("KAMI_RUN") // set for a workflow script step
@@ -251,7 +251,8 @@ type adapter struct {
 	chatKekkai, chatWorkflow string
 	coworkers                bool            // answer people other than the owner (feature flag)
 	replyAnswers             bool            // a thread reply answers its open contract; off: it goes to chat
-	mrWorkflow, picture      string          // started on a coworker's review/approve tap; sent to anything else
+	mrWorkflow               string          // started on a coworker's review/approve tap
+	banterWorkflow           string          // started for anything else a coworker (or the owner, in a channel) says
 	recent                   map[string]bool // channel/ts already handled: a mention arrives as two events
 	im                       string          // the owner's DM channel, opened once
 	st                       state
@@ -454,8 +455,6 @@ type state struct {
 	Since   int64               `json:"since"`           // last kami event handled
 	Threads map[string]*thread  `json:"threads"`         // contract id -> its DM
 	Queue   map[string][]queued `json:"queue,omitempty"` // chat thread key -> messages not yet handed to kami
-	Seen    map[string]string   `json:"seen,omitempty"`  // coworker user -> local day POWER last sent her picture
-	Count   map[string]int      `json:"count,omitempty"` // coworker user -> messages that day (other than MR links)
 	Cards   map[string]*card    `json:"cards,omitempty"` // top-level run id -> its status card
 }
 
@@ -478,7 +477,7 @@ type thread struct {
 func (a *adapter) statePath() string { return filepath.Join(a.dir, "slack.json") }
 
 func (a *adapter) load() error {
-	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Seen: map[string]string{}, Count: map[string]int{}, Cards: map[string]*card{}}
+	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}}
 	raw, err := os.ReadFile(a.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -494,12 +493,6 @@ func (a *adapter) load() error {
 	}
 	if a.st.Queue == nil {
 		a.st.Queue = map[string][]queued{}
-	}
-	if a.st.Seen == nil {
-		a.st.Seen = map[string]string{}
-	}
-	if a.st.Count == nil {
-		a.st.Count = map[string]int{}
 	}
 	if a.st.Cards == nil {
 		a.st.Cards = map[string]*card{}
