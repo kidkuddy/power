@@ -376,7 +376,7 @@ func (a *adapter) settle(ctx context.Context, id string, t *thread, line string)
 	var text string
 	var blocks []slack.Block
 	if err == nil {
-		text, blocks, err = a.sealOut(ctx, im, t.Thread, t.Text,
+		text, blocks, _, err = a.sealOut(ctx, im, t.Thread, t.Text,
 			[]slack.Block{section(t.Text), slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, line, false, false))})
 	}
 	if err == nil {
@@ -535,8 +535,7 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		return err
 	}
 	if plain != m.Text { // the owner wrote sealed: this thread stays sealed both ways
-		a.st.Sealed[sealKey] = true
-		if err := a.save(); err != nil {
+		if err := a.markSealed(sealKey); err != nil {
 			return err
 		}
 	}

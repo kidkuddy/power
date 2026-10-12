@@ -145,11 +145,6 @@ func main() {
 	if a.e2e, err = loadSealer(dir); err != nil {
 		log.Fatalf("power: %v", err)
 	}
-	if cmd == "dm" && a.e2e != nil { // read-only: which threads are sealed; serve owns the file
-		if err := a.load(); err != nil {
-			log.Fatalf("power dm: %v", err)
-		}
-	}
 	ctx := context.Background()
 	switch cmd {
 	case "serve":
@@ -307,7 +302,8 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 	}
 	if err == nil {
 		text := e.Text // the transcript keeps the plaintext; Slack gets ciphertext in a sealed thread
-		if text, blocks, err = a.sealOut(ctx, e.Channel, e.ThreadTS, text, blocks); err != nil {
+		var newRoot bool
+		if text, blocks, newRoot, err = a.sealOut(ctx, e.Channel, e.ThreadTS, text, blocks); err != nil {
 			e.Kind, e.Error = "error", "seal: "+err.Error()
 			a.record(e)
 			return "", "", err
@@ -321,6 +317,10 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 		}
 		if e.Channel, e.TS, err = a.api.PostMessageContext(ctx, im, opts...); err != nil {
 			err = fmt.Errorf("post message: %w", err)
+		} else if newRoot {
+			if err = a.markSealed(e.TS); err != nil { // posted sealed, but its thread would not stay sealed
+				err = fmt.Errorf("posted %s sealed but could not mark its thread: %w", e.TS, err)
+			}
 		}
 	}
 	if err != nil {
@@ -574,7 +574,7 @@ type state struct {
 	Day     string               `json:"day,omitempty"`    // the local day Banter counts
 	Banter  map[string]int       `json:"banter,omitempty"` // coworker -> messages handed to a session on Day
 	Convs   map[string][]convMsg `json:"convs,omitempty"`  // conversation key -> messages waiting while its session is busy
-	Sealed  map[string]bool      `json:"sealed,omitempty"` // owner DM thread key -> the owner wrote e2e3 there: post ciphertext only
+	Sealed  map[string]bool      `json:"sealed,omitempty"` // read once to move into e2e-sealed/ (see markSealed), then dropped
 }
 
 type queued struct {
@@ -596,7 +596,7 @@ type thread struct {
 func (a *adapter) statePath() string { return filepath.Join(a.dir, "slack.json") }
 
 func (a *adapter) load() error {
-	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}, Convs: map[string][]convMsg{}, Sealed: map[string]bool{}}
+	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}, Convs: map[string][]convMsg{}}
 	raw, err := os.ReadFile(a.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -622,9 +622,12 @@ func (a *adapter) load() error {
 	if a.st.Convs == nil {
 		a.st.Convs = map[string][]convMsg{}
 	}
-	if a.st.Sealed == nil {
-		a.st.Sealed = map[string]bool{}
+	for ts := range a.st.Sealed { // older builds kept sealed threads in this file
+		if err := a.markSealed(ts); err != nil {
+			return err
+		}
 	}
+	a.st.Sealed = nil
 	return nil
 }
 

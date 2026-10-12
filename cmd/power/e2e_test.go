@@ -100,8 +100,8 @@ func TestE2EThread(t *testing.T) {
 	if err := a.onMessage(ctx, reply(owner, "", "300.1", in)); err != nil {
 		t.Fatal(err)
 	}
-	if len(k.started) != 1 || k.started[0]["inputs"].(map[string]any)["text"] != "deploy the <secret> thing" || !a.st.Sealed["300.1"] {
-		t.Fatalf("started %v sealed %v", k.started, a.st.Sealed)
+	if len(k.started) != 1 || k.started[0]["inputs"].(map[string]any)["text"] != "deploy the <secret> thing" || !a.isSealed("300.1") {
+		t.Fatalf("started %v sealed %v", k.started, a.isSealed("300.1"))
 	}
 
 	// POWER's posts in that thread reach Slack as ciphertext only, text and blocks
@@ -126,6 +126,28 @@ func TestE2EThread(t *testing.T) {
 	p = s.of("chat.postMessage")
 	if n := len(p); !sealedText(p[n-3].Get("text")) || p[n-2].Get("text") != "elsewhere" || p[n-1].Get("text") != "plain thread" {
 		t.Fatalf("posts %v", p[n-3:])
+	}
+
+	// a step of the sealed conversation's run posts a new root (launch's "🧵 …" for "thread me …"):
+	// the post is sealed, and so is everything later posted in that new thread
+	k.mu.Lock()
+	k.runs["rchat"] = map[string]any{"id": "rchat", "workflow": "chat", "vars": map[string]any{"thread_ts": "300.1"}}
+	k.runs["rplain"] = map[string]any{"id": "rplain", "workflow": "chat", "vars": map[string]any{"thread_ts": "400.1"}}
+	k.mu.Unlock()
+	a.run = "rchat"
+	_, root, err := a.post(ctx, entry{Text: "🧵 build the secret thing"}, nil)
+	a.run = ""
+	p = s.of("chat.postMessage")
+	if err != nil || !sealedText(p[len(p)-1].Get("text")) || !a.isSealed(root) {
+		t.Fatalf("launched root: %v %v sealed %v", err, p[len(p)-1], a.isSealed(root))
+	}
+	a.post(ctx, entry{ThreadTS: root, Text: "milestone of the launched run"}, nil)
+	a.run = "rplain" // a run of a plain thread posting a new root stays plain
+	a.post(ctx, entry{Text: "daily report"}, nil)
+	a.run = ""
+	p = s.of("chat.postMessage")
+	if n := len(p); !sealedText(p[n-2].Get("text")) || p[n-1].Get("text") != "daily report" {
+		t.Fatalf("after launch: %v", p[n-2:])
 	}
 
 	// the thread's history reaches the chat decrypted
@@ -210,7 +232,7 @@ func TestE2EThread(t *testing.T) {
 		t.Fatal(err)
 	}
 	p = s.of("chat.postMessage")
-	if len(k.started) != 1 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") || a.st.Sealed["500.1"] {
+	if len(k.started) != 1 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") || a.isSealed("500.1") {
 		t.Fatalf("stranger: started %d last %v", len(k.started), p[len(p)-1])
 	}
 }
@@ -222,4 +244,17 @@ func mustPub(t *testing.T, b []byte) *ecdh.PublicKey {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// sealed threads older builds kept in slack.json move to e2e-sealed/ on load
+func TestE2EMigrate(t *testing.T) {
+	_, _, start := setup(t)
+	a := start()
+	if err := writeAtomic(a.statePath(), []byte(`{"since": 1, "sealed": {"300.9": true}}`)); err != nil {
+		t.Fatal(err)
+	}
+	a = start()
+	if !a.isSealed("300.9") || a.st.Sealed != nil {
+		t.Fatalf("migrate: sealed %v state %v", a.isSealed("300.9"), a.st.Sealed)
+	}
 }
