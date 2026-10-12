@@ -56,6 +56,7 @@ power pin [--off] [--channel C] <ts>
 power wrap <thread ts>                      # unpin a chat thread and its status cards
 power directory                             # {"owner", "owner_im", "users": {id: name}}
 power canvas [--key slug] [--users U1,U2] "Title" < doc.md   # private canvas; same key edits the same one
+power e2e [<owner public key>]              # make POWER's e2e key once, record the owner's; prints POWER's key
 ```
 
 Workflow scripts call these: a chat posts its reply with `power dm --thread {thread_ts} "…"`.
@@ -73,6 +74,15 @@ When you reply in a thread, POWER tries these in order:
 
 `answer field=value …` fills a form. Values parse as JSON when they can. A refusal from Kami
 comes back in the thread.
+
+## Encrypted threads
+
+With [sshhh](https://github.com/kidkuddy/sshhh) on the owner's Mac, a DM written as `e2e3:…` ciphertext
+seals its thread: POWER decrypts what the owner writes (and the thread history) for the chat, and
+everything she posts or redraws there goes to Slack as ciphertext only. Keys live in
+`$KAMI_HOME/adapters/e2e.json` (0600); without that file nothing is sealed. Set it up with
+`power e2e <the key sshhh prints>`, then give sshhh POWER's key (`E2E_PEERS`). Button labels,
+uploaded images, reactions and who-wrote-when stay visible to Slack.
 
 ## Audit
 

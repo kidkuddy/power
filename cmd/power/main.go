@@ -41,6 +41,7 @@ const usage = `power — Kami's Slack surface (niffty's Slack app)
   power react [--channel C] <ts> <emoji>    add an emoji reaction (owner DM by default)
   power upload [--channel C] [--thread TS] <file>   post an image or file
   power directory                          {"owner", "owner_im", "users": {id: name}} for scripts
+  power e2e [<owner public key>]            make POWER's e2e key (once), record the owner's sshhh key; prints POWER's key
   power pin [--off] [--channel C] <ts>     pin (or unpin) a message, the owner DM by default
   power wrap <thread ts>                    unpin a chat thread and the status cards in it
   power canvas [--key <slug>] [--users U1,U2] <title>   markdown on stdin → private canvas shared with the owner (and users); prints its URL
@@ -109,6 +110,13 @@ func main() {
 			log.Fatalf("power threads: %v", err)
 		}
 		return
+	case "e2e":
+		pub, err := e2eSetup(dir, fs.Arg(0))
+		if err != nil {
+			log.Fatalf("power e2e: %v", err)
+		}
+		fmt.Println(pub)
+		return
 	}
 
 	env, err := dotenv(*envPath, "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "NIFFTY_OWNER_ID")
@@ -133,6 +141,14 @@ func main() {
 	}
 	if cmd != "serve" {
 		a.run = os.Getenv("KAMI_RUN") // set for a workflow script step
+	}
+	if a.e2e, err = loadSealer(dir); err != nil {
+		log.Fatalf("power: %v", err)
+	}
+	if cmd == "dm" && a.e2e != nil { // read-only: which threads are sealed; serve owns the file
+		if err := a.load(); err != nil {
+			log.Fatalf("power dm: %v", err)
+		}
 	}
 	ctx := context.Background()
 	switch cmd {
@@ -275,6 +291,7 @@ type adapter struct {
 	st                       state
 	run                      string          // $KAMI_RUN of a script step's dm/canvas, for the transcript
 	links                    map[string]link // run id -> its thread, once known
+	e2e                      *sealer         // nil: no e2e.json, threads are never sealed
 }
 
 // --- Slack ---------------------------------------------------------------------
@@ -289,7 +306,13 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 		im, err = a.dm(ctx)
 	}
 	if err == nil {
-		opts := []slack.MsgOption{slack.MsgOptionText(e.Text, false)}
+		text := e.Text // the transcript keeps the plaintext; Slack gets ciphertext in a sealed thread
+		if text, blocks, err = a.sealOut(ctx, e.Channel, e.ThreadTS, text, blocks); err != nil {
+			e.Kind, e.Error = "error", "seal: "+err.Error()
+			a.record(e)
+			return "", "", err
+		}
+		opts := []slack.MsgOption{slack.MsgOptionText(text, false)}
 		if blocks != nil {
 			opts = append(opts, slack.MsgOptionBlocks(blocks...))
 		}
@@ -551,6 +574,7 @@ type state struct {
 	Day     string               `json:"day,omitempty"`    // the local day Banter counts
 	Banter  map[string]int       `json:"banter,omitempty"` // coworker -> messages handed to a session on Day
 	Convs   map[string][]convMsg `json:"convs,omitempty"`  // conversation key -> messages waiting while its session is busy
+	Sealed  map[string]bool      `json:"sealed,omitempty"` // owner DM thread key -> the owner wrote e2e3 there: post ciphertext only
 }
 
 type queued struct {
@@ -572,7 +596,7 @@ type thread struct {
 func (a *adapter) statePath() string { return filepath.Join(a.dir, "slack.json") }
 
 func (a *adapter) load() error {
-	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}, Convs: map[string][]convMsg{}}
+	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}, Convs: map[string][]convMsg{}, Sealed: map[string]bool{}}
 	raw, err := os.ReadFile(a.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -597,6 +621,9 @@ func (a *adapter) load() error {
 	}
 	if a.st.Convs == nil {
 		a.st.Convs = map[string][]convMsg{}
+	}
+	if a.st.Sealed == nil {
+		a.st.Sealed = map[string]bool{}
 	}
 	return nil
 }
