@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -256,5 +257,18 @@ func TestE2EMigrate(t *testing.T) {
 	a = start()
 	if !a.isSealed("300.9") || a.st.Sealed != nil {
 		t.Fatalf("migrate: sealed %v state %v", a.isSealed("300.9"), a.st.Sealed)
+	}
+
+	// power dm from the CLI migrates too, without rewriting slack.json
+	before, _ := os.ReadFile(a.statePath())
+	if err := writeAtomic(a.statePath(), []byte(`{"since": 1, "sealed": {"301.1": true}}`)); err != nil {
+		t.Fatal(err)
+	}
+	cli := &adapter{dir: a.dir}
+	if err := cli.load(); err != nil || !cli.isSealed("301.1") {
+		t.Fatalf("cli migrate: %v %v", err, cli.isSealed("301.1"))
+	}
+	if after, _ := os.ReadFile(a.statePath()); string(after) != `{"since": 1, "sealed": {"301.1": true}}` {
+		t.Fatalf("load rewrote slack.json: %s (was %s)", after, before)
 	}
 }

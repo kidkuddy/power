@@ -145,6 +145,13 @@ func main() {
 	if a.e2e, err = loadSealer(dir); err != nil {
 		log.Fatalf("power: %v", err)
 	}
+	if cmd == "dm" && a.e2e != nil {
+		// an older serve may still be running and marking sealed threads in slack.json: move those marks
+		// into e2e-sealed/ here too. Read-only for slack.json; serve owns that file.
+		if err := a.load(); err != nil {
+			log.Fatalf("power dm: %v", err)
+		}
+	}
 	ctx := context.Background()
 	switch cmd {
 	case "serve":
