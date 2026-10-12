@@ -86,7 +86,11 @@ func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev kami.
 	} else {
 		im, err := a.dm(ctx)
 		if err == nil {
-			_, _, _, err = a.api.UpdateMessageContext(ctx, im, c.TS, slack.MsgOptionText(t, false), slack.MsgOptionBlocks(section(t)))
+			var st string
+			var blocks []slack.Block
+			if st, blocks, err = a.sealOut(ctx, im, c.Thread, t, []slack.Block{section(t)}); err == nil {
+				_, _, _, err = a.api.UpdateMessageContext(ctx, im, c.TS, slack.MsgOptionText(st, false), slack.MsgOptionBlocks(blocks...))
+			}
 		}
 		if err != nil {
 			e.Kind, e.Error = "error", "card: "+err.Error()

@@ -373,9 +373,14 @@ func (a *adapter) settle(ctx context.Context, id string, t *thread, line string)
 		return
 	}
 	im, err := a.dm(ctx)
+	var text string
+	var blocks []slack.Block
 	if err == nil {
-		_, _, _, err = a.api.UpdateMessageContext(ctx, im, t.TS, slack.MsgOptionText(t.Text, false),
-			slack.MsgOptionBlocks(section(t.Text), slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, line, false, false))))
+		text, blocks, err = a.sealOut(ctx, im, t.Thread, t.Text,
+			[]slack.Block{section(t.Text), slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, line, false, false))})
+	}
+	if err == nil {
+		_, _, _, err = a.api.UpdateMessageContext(ctx, im, t.TS, slack.MsgOptionText(text, false), slack.MsgOptionBlocks(blocks...))
 	}
 	if err != nil {
 		a.logErr(err)
@@ -425,8 +430,14 @@ func (a *adapter) onAction(ctx context.Context, cb slack.InteractionCallback) er
 			continue
 		}
 		id, _, _ := strings.Cut(rest, ":")
+		val, readable := a.unseal(act.Value, "bot") // a sealed thread's buttons carry values POWER sealed
 		e := entry{Dir: "in", Kind: "button", Channel: cb.Channel.ID, TS: cb.Message.Timestamp, User: cb.User.ID,
-			Text: act.Value, Value: act.Value, ContractID: id}
+			Text: val, Value: val, ContractID: id}
+		if !readable {
+			e.Error = "e2e3: unreadable button value"
+			a.record(e)
+			continue
+		}
 		t := a.st.Threads[id]
 		if t == nil {
 			log.Printf("power: tap on unknown contract %s", id)
@@ -435,7 +446,7 @@ func (a *adapter) onAction(ctx context.Context, cb slack.InteractionCallback) er
 			continue
 		}
 		e.TS, e.RunID, e.Workflow = t.TS, t.RunID, t.Workflow
-		ans, err := a.resolve(ctx, id, t, act.Value, nil, false)
+		ans, err := a.resolve(ctx, id, t, val, nil, false)
 		e.Answer = ans
 		if err != nil {
 			e.Error = err.Error()
@@ -503,7 +514,8 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		return nil
 	}
 	inThread := m.ThreadTimeStamp != "" && m.ThreadTimeStamp != m.TimeStamp
-	in := entry{Dir: "in", Kind: "dm", Channel: m.Channel, TS: m.TimeStamp, ThreadTS: m.ThreadTimeStamp, User: m.User, Text: m.Text}
+	plain, readable := a.unseal(m.Text, "owner")
+	in := entry{Dir: "in", Kind: "dm", Channel: m.Channel, TS: m.TimeStamp, ThreadTS: m.ThreadTimeStamp, User: m.User, Text: plain}
 	if inThread {
 		in.Kind = "thread_reply"
 	}
@@ -512,7 +524,27 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		a.record(in)
 		return nil
 	}
-	text := unslack(m.Text) + a.keepImages(ctx, m)
+	sealKey := m.TimeStamp // the thread this message is in, or starts
+	if inThread {
+		sealKey = m.ThreadTimeStamp
+	}
+	if !readable { // e2e3 POWER cannot open: wrong key, not from the owner's key, or tampered
+		in.Error = "e2e3: unreadable"
+		a.record(in)
+		_, _, err := a.post(ctx, entry{Kind: "error", ThreadTS: sealKey, Text: "🔒 POWER could not decrypt that message (wrong key, or not from your key).", Error: in.Error}, nil)
+		return err
+	}
+	if plain != m.Text { // the owner wrote sealed: this thread stays sealed both ways
+		a.st.Sealed[sealKey] = true
+		if err := a.save(); err != nil {
+			return err
+		}
+	}
+	text := plain
+	if plain == m.Text {
+		text = unslack(m.Text) // ciphertext has no Slack encoding; the plaintext is the owner's own words
+	}
+	text += a.keepImages(ctx, m)
 	answer := func(id string, t *thread, c *kami.ContractView) error {
 		in.ContractID, in.RunID, in.Workflow = id, t.RunID, t.Workflow
 		a.record(in)
@@ -773,7 +805,13 @@ func (a *adapter) history(ctx context.Context, threadTS string, skip map[string]
 	var lines []string
 	for _, m := range msgs {
 		if !skip[m.Timestamp] {
-			lines = append(lines, a.who(m)+": "+unslack(m.Text))
+			t, ok := a.unseal(m.Text, a.who(m)) // the key must match who Slack says wrote it
+			if !ok {
+				t = "(encrypted message, not from the expected key)"
+			} else if t == m.Text {
+				t = unslack(t)
+			}
+			lines = append(lines, a.who(m)+": "+t)
 		}
 	}
 	h := strings.Join(lines, "\n")
