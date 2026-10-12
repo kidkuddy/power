@@ -164,7 +164,7 @@ type call struct {
 	Form   url.Values
 }
 
-// fakeSlack answers the Web API methods kami-slack uses and records each call.
+// fakeSlack answers the Web API methods power uses and records each call.
 type fakeSlack struct {
 	mu      sync.Mutex
 	calls   []call

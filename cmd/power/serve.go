@@ -36,12 +36,12 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 	if id, err := a.api.AuthTestContext(ctx); err == nil {
 		a.botUser = id.UserID
 	} else {
-		log.Printf("kami-slack: auth.test: %v (channel mentions will not be recognised)", err)
+		log.Printf("power: auth.test: %v (channel mentions will not be recognised)", err)
 	}
 	sm := socketmode.New(a.api)
 	errc := make(chan error, 1)
 	go func() { errc <- sm.RunContext(ctx) }()
-	log.Printf("kami-slack: serving; state %s, from event %d", a.statePath(), a.st.Since)
+	log.Printf("power: serving; state %s, from event %d", a.statePath(), a.st.Since)
 	t := time.NewTicker(poll)
 	defer t.Stop()
 	a.logErr(a.events(ctx))
@@ -56,7 +56,7 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 		case evt := <-sm.Events:
 			switch evt.Type {
 			case socketmode.EventTypeConnected:
-				log.Printf("kami-slack: connected to Slack")
+				log.Printf("power: connected to Slack")
 			case socketmode.EventTypeEventsAPI:
 				ev, ok := evt.Data.(slackevents.EventsAPIEvent)
 				if !ok || evt.Request == nil {
@@ -85,7 +85,7 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 
 func (a *adapter) logErr(err error) {
 	if err != nil {
-		log.Printf("kami-slack: %v", err)
+		log.Printf("power: %v", err)
 	}
 }
 
@@ -332,7 +332,7 @@ func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
 			return err
 		}
 		a.st.Threads[id] = &thread{TS: ts, Thread: l.thread, Text: text, Buttons: buttons, RunID: c.RunID, Workflow: c.Workflow}
-		log.Printf("kami-slack: contract %s → DM %s", id, ts)
+		log.Printf("power: contract %s → DM %s", id, ts)
 	case "contract.resolved":
 		if !t.Mine {
 			by, _ := ev.Data["by"].(string)
@@ -429,7 +429,7 @@ func (a *adapter) onAction(ctx context.Context, cb slack.InteractionCallback) er
 			Text: act.Value, Value: act.Value, ContractID: id}
 		t := a.st.Threads[id]
 		if t == nil {
-			log.Printf("kami-slack: tap on unknown contract %s", id)
+			log.Printf("power: tap on unknown contract %s", id)
 			e.Error = "unknown contract"
 			a.record(e)
 			continue
@@ -520,7 +520,7 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		_, err := a.resolve(ctx, id, t, ans, data, true)
 		return err
 	}
-	// Without --reply-answers every reply goes to the chat run, which answers contracts itself (kami-slack answer).
+	// Without --reply-answers every reply goes to the chat run, which answers contracts itself (power answer).
 	for id, t := range a.st.Threads { // the thread under a top-level contract message
 		if !a.replyAnswers || !inThread || t.Thread != "" || t.TS != m.ThreadTimeStamp {
 			continue
@@ -561,7 +561,7 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 	}
 	re := entry{Dir: "out", Kind: "reaction", Channel: m.Channel, TS: m.TimeStamp, ThreadTS: m.ThreadTimeStamp, Text: "eyes"}
 	if err := a.api.AddReactionContext(ctx, "eyes", slack.NewRefToMessage(m.Channel, m.TimeStamp)); err != nil {
-		log.Printf("kami-slack: react on %s: %v", m.TimeStamp, err)
+		log.Printf("power: react on %s: %v", m.TimeStamp, err)
 		re.Error = err.Error()
 	}
 	a.record(re)
@@ -818,7 +818,7 @@ func (a *adapter) repliesIn(ctx context.Context, channel, threadTS string) ([]sl
 // from kami goes to the thread so the owner can retry. It returns the answer
 // kami recorded, empty when kami refused.
 func (a *adapter) resolve(ctx context.Context, id string, t *thread, answer string, data map[string]any, inThread bool) (string, error) {
-	body := map[string]any{"answer": answer, "data": data, "note": "via slack (kami-slack)"}
+	body := map[string]any{"answer": answer, "data": data, "note": "via slack (power)"}
 	var out kami.ContractView
 	err := a.kamiCall("POST", "/contracts/"+url.PathEscape(id)+"/resolve", body, &out)
 	var ke *kamiErr

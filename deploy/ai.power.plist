@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Rendered by `make launchd-install` (kami-slack serve): __HOME__ and __PATH__ are filled in. -->
+<!-- Rendered by `make launchd-install` (power serve): __HOME__ and __PATH__ are filled in. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>ai.kami.slack</string>
+  <string>ai.power</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__HOME__/.local/bin/kami-slack</string>
+    <string>__HOME__/.local/bin/power</string>
     <string>serve</string>
   </array>
   <key>EnvironmentVariables</key>
@@ -24,8 +24,8 @@
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>__HOME__/.kami/kami-slack.log</string>
+  <string>__HOME__/.kami/power.log</string>
   <key>StandardErrorPath</key>
-  <string>__HOME__/.kami/kami-slack.log</string>
+  <string>__HOME__/.kami/power.log</string>
 </dict>
 </plist>

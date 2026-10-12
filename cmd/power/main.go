@@ -1,4 +1,4 @@
-// Command kami-slack is Kami's Slack surface. `serve` DMs the owner every
+// Command power is Kami's Slack surface. `serve` DMs the owner every
 // contract as it opens and resolves it from a button or a thread reply; `dm`
 // and `canvas` are for workflow script steps.
 //
@@ -29,26 +29,26 @@ import (
 	"power/internal/kami"
 )
 
-const usage = `kami-slack — Kami's Slack surface (niffty's Slack app)
+const usage = `power — Kami's Slack surface (niffty's Slack app)
 
-  kami-slack serve [--poll 5s] [--kekkai K]     contracts → owner DMs; buttons and thread replies resolve them;
+  power serve [--poll 5s] [--kekkai K]     contracts → owner DMs; buttons and thread replies resolve them;
                    [--chat-kekkai work] [--chat-workflow chat]   other owner DMs go to a chat run
                    [--coworkers=true] [--mr-workflow mr] [--conv-workflow converse]   anyone else (and you, in
                                                 channels): an MR link gets review/approve buttons, anything else that conversation's session
-  kami-slack dm [--channel C] [--thread TS] [<text>...]   DM the owner, or post to C (text on stdin when no args); prints {"channel","ts"}
-  kami-slack answer [--data JSON] <contract> <answer...>   answer a contract as the owner, from POWER's chat
+  power dm [--channel C] [--thread TS] [<text>...]   DM the owner, or post to C (text on stdin when no args); prints {"channel","ts"}
+  power answer [--data JSON] <contract> <answer...>   answer a contract as the owner, from POWER's chat
                                                 (refuses 🔒 contracts: those take a button press)
-  kami-slack react [--channel C] <ts> <emoji>    add an emoji reaction (owner DM by default)
-  kami-slack upload [--channel C] [--thread TS] <file>   post an image or file
-  kami-slack directory                          {"owner", "owner_im", "users": {id: name}} for scripts
-  kami-slack pin [--off] [--channel C] <ts>     pin (or unpin) a message, the owner DM by default
-  kami-slack wrap <thread ts>                    unpin a chat thread and the status cards in it
-  kami-slack canvas [--key <slug>] [--users U1,U2] <title>   markdown on stdin → private canvas shared with the owner (and users); prints its URL
+  power react [--channel C] <ts> <emoji>    add an emoji reaction (owner DM by default)
+  power upload [--channel C] [--thread TS] <file>   post an image or file
+  power directory                          {"owner", "owner_im", "users": {id: name}} for scripts
+  power pin [--off] [--channel C] <ts>     pin (or unpin) a message, the owner DM by default
+  power wrap <thread ts>                    unpin a chat thread and the status cards in it
+  power canvas [--key <slug>] [--users U1,U2] <title>   markdown on stdin → private canvas shared with the owner (and users); prints its URL
 
   audit (every message in and out is in $KAMI_HOME/adapters/slack-transcript.ndjson):
-  kami-slack thread <ts> [--json]               a thread of the owner DM, live from Slack, with its contract/run ids
-  kami-slack threads [--since 24h] [--json]     threads in the transcript: root, first line, messages, last activity, runs, contracts
-  kami-slack log [-f] [--run R] [--contract C] [--thread T] [--json]   the transcript, filtered; -f follows
+  power thread <ts> [--json]               a thread of the owner DM, live from Slack, with its contract/run ids
+  power threads [--since 24h] [--json]     threads in the transcript: root, first line, messages, last activity, runs, contracts
+  power log [-f] [--run R] [--contract C] [--thread T] [--json]   the transcript, filtered; -f follows
 
   common flags: --slack-env PATH (default ~/.local/share/niffty/.env)  --kami-sock PATH`
 
@@ -59,7 +59,7 @@ func main() {
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	h, _ := os.UserHomeDir()
-	fs := flag.NewFlagSet("kami-slack "+cmd, flag.ExitOnError)
+	fs := flag.NewFlagSet("power "+cmd, flag.ExitOnError)
 	fs.Usage = func() { fmt.Fprintln(os.Stderr, usage) }
 	envPath := fs.String("slack-env", filepath.Join(h, ".local/share/niffty/.env"), "file holding SLACK_BOT_TOKEN, SLACK_APP_TOKEN, NIFFTY_OWNER_ID")
 	sock := fs.String("kami-sock", kamiSock(), "kami daemon socket")
@@ -97,7 +97,7 @@ func main() {
 		err := printLog(context.Background(), os.Stdout, filepath.Join(dir, "slack-transcript.ndjson"),
 			filter{run: *run, contract: *contract, thread: *thread}, *follow, *asJSON)
 		if err != nil {
-			log.Fatalf("kami-slack log: %v", err)
+			log.Fatalf("power log: %v", err)
 		}
 		return
 	case "threads":
@@ -106,17 +106,17 @@ func main() {
 			err = printThreads(os.Stdout, summarize(entries, time.Now().Add(-*since)), *asJSON)
 		}
 		if err != nil {
-			log.Fatalf("kami-slack threads: %v", err)
+			log.Fatalf("power threads: %v", err)
 		}
 		return
 	}
 
 	env, err := dotenv(*envPath, "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "NIFFTY_OWNER_ID")
 	if err != nil {
-		log.Fatalf("kami-slack: %v", err)
+		log.Fatalf("power: %v", err)
 	}
 	if env["SLACK_BOT_TOKEN"] == "" || env["NIFFTY_OWNER_ID"] == "" {
-		log.Fatalf("kami-slack: SLACK_BOT_TOKEN and NIFFTY_OWNER_ID must be set in %s", *envPath)
+		log.Fatalf("power: SLACK_BOT_TOKEN and NIFFTY_OWNER_ID must be set in %s", *envPath)
 	}
 	a := &adapter{
 		api:          slack.New(env["SLACK_BOT_TOKEN"], slack.OptionAppLevelToken(env["SLACK_APP_TOKEN"])),
@@ -138,7 +138,7 @@ func main() {
 	switch cmd {
 	case "serve":
 		if env["SLACK_APP_TOKEN"] == "" {
-			log.Fatalf("kami-slack: SLACK_APP_TOKEN must be set in %s for serve", *envPath)
+			log.Fatalf("power: SLACK_APP_TOKEN must be set in %s for serve", *envPath)
 		}
 		err = a.serve(ctx, *poll)
 	case "dm":
@@ -148,7 +148,7 @@ func main() {
 			text = string(raw)
 		}
 		if strings.TrimSpace(text) == "" {
-			log.Fatal("kami-slack dm: no text")
+			log.Fatal("power dm: no text")
 		}
 		kind := "dm"
 		if *thread != "" {
@@ -161,7 +161,7 @@ func main() {
 	case "canvas":
 		title := strings.Join(fs.Args(), " ")
 		if title == "" {
-			log.Fatal("kami-slack canvas: a title is required")
+			log.Fatal("power canvas: a title is required")
 		}
 		raw, _ := io.ReadAll(os.Stdin)
 		var u string
@@ -170,40 +170,40 @@ func main() {
 		}
 	case "answer":
 		if fs.NArg() < 2 {
-			log.Fatal("kami-slack answer: a contract id and an answer are required")
+			log.Fatal("power answer: a contract id and an answer are required")
 		}
 		var d map[string]any
 		if *data != "" {
 			if err := json.Unmarshal([]byte(*data), &d); err != nil {
-				log.Fatalf("kami-slack answer: --data: %v", err)
+				log.Fatalf("power answer: --data: %v", err)
 			}
 		}
 		err = a.answer(fs.Arg(0), strings.Join(fs.Args()[1:], " "), d)
 	case "wrap":
 		if fs.NArg() != 1 {
-			log.Fatal("kami-slack wrap: one thread ts is required")
+			log.Fatal("power wrap: one thread ts is required")
 		}
 		err = a.wrap(ctx, fs.Arg(0))
 	case "react":
 		if fs.NArg() != 2 {
-			log.Fatal("kami-slack react: a message ts and an emoji name are required")
+			log.Fatal("power react: a message ts and an emoji name are required")
 		}
 		err = a.react(ctx, *channel, fs.Arg(0), strings.Trim(fs.Arg(1), ":"))
 	case "upload":
 		if fs.NArg() != 1 {
-			log.Fatal("kami-slack upload: one file is required")
+			log.Fatal("power upload: one file is required")
 		}
 		err = a.upload(ctx, *channel, *thread, fs.Arg(0))
 	case "directory":
 		err = a.directory(ctx, os.Stdout)
 	case "pin":
 		if fs.NArg() != 1 {
-			log.Fatal("kami-slack pin: one message ts is required")
+			log.Fatal("power pin: one message ts is required")
 		}
 		err = a.pin(ctx, *channel, fs.Arg(0), !*off)
 	case "thread":
 		if len(rest) != 1 {
-			log.Fatal("kami-slack thread: one thread ts is required")
+			log.Fatal("power thread: one thread ts is required")
 		}
 		err = a.printThread(ctx, os.Stdout, rest[0], *asJSON)
 	default:
@@ -211,7 +211,7 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		log.Fatalf("kami-slack %s: %v", cmd, err)
+		log.Fatalf("power %s: %v", cmd, err)
 	}
 }
 
@@ -453,7 +453,7 @@ func (a *adapter) writeCanvas(ctx context.Context, key, title, markdown string, 
 			if err == nil {
 				return a.permalink(ctx, id)
 			}
-			log.Printf("kami-slack: canvas %s for key %s unreachable (%v); making a new one", id, key, err)
+			log.Printf("power: canvas %s for key %s unreachable (%v); making a new one", id, key, err)
 		}
 	}
 	id, err := a.api.CreateCanvasContext(ctx, title, doc)

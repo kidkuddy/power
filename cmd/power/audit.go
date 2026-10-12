@@ -66,7 +66,7 @@ func (a *adapter) record(e entry) {
 		}
 	}
 	if err != nil {
-		log.Printf("kami-slack: transcript: %v", err)
+		log.Printf("power: transcript: %v", err)
 	}
 }
 

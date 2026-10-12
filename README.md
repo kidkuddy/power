@@ -34,8 +34,8 @@ whatever you say to her goes back to Kami. The flows live in their own kekkais (
 ## Install
 
 ```sh
-make install            # ~/.local/bin/kami-slack
-make launchd-install    # keep `kami-slack serve` running (log: ~/.kami/kami-slack.log)
+make install            # ~/.local/bin/power
+make launchd-install    # keep `power serve` running (log: ~/.kami/power.log)
 ```
 
 She uses niffty's Slack app: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` and `NIFFTY_OWNER_ID`, read from
@@ -46,19 +46,19 @@ or both will receive the same Socket Mode events. She talks to the Kami daemon o
 ## Commands
 
 ```sh
-kami-slack serve [--poll 5s] [--kekkai K]        # the bot: contracts → DMs, DMs → chats
+power serve [--poll 5s] [--kekkai K]        # the bot: contracts → DMs, DMs → chats
       [--chat-kekkai work] [--chat-workflow chat] [--coworkers=true] [--mr-workflow mr] [--conv-workflow converse]
-kami-slack dm [--channel C] [--thread TS] "text" # DM the owner (or post to C); prints {"channel","ts"}
-kami-slack answer [--data JSON] <contract> <answer>   # answer as the owner; refuses 🔒 contracts
-kami-slack react [--channel C] <ts> <emoji>
-kami-slack upload [--channel C] [--thread TS] <file>
-kami-slack pin [--off] [--channel C] <ts>
-kami-slack wrap <thread ts>                      # unpin a chat thread and its status cards
-kami-slack directory                             # {"owner", "owner_im", "users": {id: name}}
-kami-slack canvas [--key slug] [--users U1,U2] "Title" < doc.md   # private canvas; same key edits the same one
+power dm [--channel C] [--thread TS] "text" # DM the owner (or post to C); prints {"channel","ts"}
+power answer [--data JSON] <contract> <answer>   # answer as the owner; refuses 🔒 contracts
+power react [--channel C] <ts> <emoji>
+power upload [--channel C] [--thread TS] <file>
+power pin [--off] [--channel C] <ts>
+power wrap <thread ts>                      # unpin a chat thread and its status cards
+power directory                             # {"owner", "owner_im", "users": {id: name}}
+power canvas [--key slug] [--users U1,U2] "Title" < doc.md   # private canvas; same key edits the same one
 ```
 
-Workflow scripts call these: a chat posts its reply with `kami-slack dm --thread {thread_ts} "…"`.
+Workflow scripts call these: a chat posts its reply with `power dm --thread {thread_ts} "…"`.
 
 ## How a message finds its run
 
@@ -81,9 +81,9 @@ Every message in and out is one NDJSON line in `$KAMI_HOME/adapters/slack-transc
 or workflow when there is one. Tokens and HTTP headers are never written.
 
 ```sh
-kami-slack log [-f] [--run R] [--contract C] [--thread T] [--json]
-kami-slack threads [--since 24h] [--json]
-kami-slack thread <ts> [--json]                  # live from Slack, with contract/run ids
+power log [-f] [--run R] [--contract C] [--thread T] [--json]
+power threads [--since 24h] [--json]
+power thread <ts> [--json]                  # live from Slack, with contract/run ids
 ```
 
 State (last event id, contract ↔ message, queued chat messages) is `$KAMI_HOME/adapters/slack.json`.
@@ -97,7 +97,7 @@ same way (`power-images → persona/images`), so every kekkai gets the same POWE
 ## Layout
 
 ```
-cmd/kami-slack/   the adapter (Socket Mode, buttons, threads, cards, audit)
+cmd/power/   the adapter (Socket Mode, buttons, threads, cards, audit)
 internal/kami/    the slice of Kami's HTTP API she reads (her own copy: she's a client, not a module of Kami)
 persona/          power.md and her reaction GIFs
 deploy/           the launchd agent

@@ -99,7 +99,7 @@ func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev kami.
 	return a.save()
 }
 
-// wrap unpins a thread's root and every card in it (kami-slack wrap).
+// wrap unpins a thread's root and every card in it (power wrap).
 func (a *adapter) wrap(ctx context.Context, thread string) error {
 	if err := a.load(); err != nil {
 		return err
