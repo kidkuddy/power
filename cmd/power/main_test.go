@@ -19,8 +19,7 @@ import (
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 
-	"kami/internal/engine"
-	"kami/internal/eventbus"
+	"power/internal/kami"
 )
 
 const owner = "UOWNER"
@@ -28,8 +27,8 @@ const owner = "UOWNER"
 // fakeKami serves /events, /contracts/{id} and /contracts/{id}/resolve.
 type fakeKami struct {
 	mu        sync.Mutex
-	events    []eventbus.Event
-	contracts map[string]*engine.Contract
+	events    []kami.Event
+	contracts map[string]*kami.Contract
 	resolves  []string // "id=answer data"
 
 	signals []map[string]any
@@ -43,11 +42,11 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 	env := func(w http.ResponseWriter, v any, code, msg string) {
 		if code != "" {
 			w.WriteHeader(422)
-			json.NewEncoder(w).Encode(engine.Envelope{Error: &engine.APIError{Code: code, Message: msg}})
+			json.NewEncoder(w).Encode(kami.Envelope{Error: &kami.APIError{Code: code, Message: msg}})
 			return
 		}
 		raw, _ := json.Marshal(v)
-		json.NewEncoder(w).Encode(engine.Envelope{OK: true, Data: raw})
+		json.NewEncoder(w).Encode(kami.Envelope{OK: true, Data: raw})
 	}
 	m := http.NewServeMux()
 	m.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
@@ -84,9 +83,12 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		if ok && q.Get("status") == "active" && q.Get("kekkai") == "work" && k.busy[key] {
 			runs = append(runs, map[string]any{"id": "run-" + key, "workflow": "chat", "status": "running"})
 		}
-		if ok && q.Get("status") == "" {
+		if ck, isConv := strings.CutPrefix(q.Get("var"), "kami_key="); isConv && q.Get("status") == "active" && k.busy[ck] {
+			runs = append(runs, map[string]any{"id": "run-" + ck, "workflow": "converse", "status": "running"})
+		}
+		if name, val, isVar := strings.Cut(q.Get("var"), "="); isVar && q.Get("status") == "" {
 			for id, run := range k.runs {
-				if vars, _ := run["vars"].(map[string]any); vars["thread_ts"] == key {
+				if vars, _ := run["vars"].(map[string]any); vars[name] == val {
 					runs = append(runs, map[string]any{"id": id, "workflow": run["workflow"]})
 				}
 			}
@@ -107,17 +109,28 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		defer k.mu.Unlock()
 		var req map[string]any
 		json.NewDecoder(r.Body).Decode(&req)
-		if req["workflow"] != "chat" {
+		if req["workflow"] != "chat" && req["workflow"] != "mr" && req["workflow"] != "converse" {
 			env(w, nil, "NOT_FOUND", fmt.Sprintf("no workflow %q in kekkai work", req["workflow"]))
 			return
 		}
 		k.started = append(k.started, req)
 		env(w, map[string]any{"id": "run-new"}, "", "")
 	})
+	m.HandleFunc("GET /contracts", func(w http.ResponseWriter, r *http.Request) {
+		k.mu.Lock()
+		defer k.mu.Unlock()
+		out := []kami.ContractView{}
+		for _, c := range k.contracts {
+			if c.RunID == r.URL.Query().Get("run") && c.Status == "open" {
+				out = append(out, kami.ContractView{Contract: c, Workflow: "chat"})
+			}
+		}
+		env(w, out, "", "")
+	})
 	m.HandleFunc("GET /contracts/{id}", func(w http.ResponseWriter, r *http.Request) {
 		k.mu.Lock()
 		defer k.mu.Unlock()
-		env(w, engine.ContractView{Contract: k.contracts[r.PathValue("id")], Effective: "attended", Workflow: "hello"}, "", "")
+		env(w, kami.ContractView{Contract: k.contracts[r.PathValue("id")], Effective: "attended", Workflow: "hello"}, "", "")
 	})
 	m.HandleFunc("POST /contracts/{id}/resolve", func(w http.ResponseWriter, r *http.Request) {
 		k.mu.Lock()
@@ -140,8 +153,8 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 			env(w, nil, "INVALID", fmt.Sprintf("field \"rating\": want enum:good,bad, got %v", req.Data["rating"]))
 			return
 		}
-		c.Status, c.Resolution = "resolved", &engine.Resolution{Answer: req.Answer, By: "human"}
-		env(w, engine.ContractView{Contract: c}, "", "")
+		c.Status, c.Resolution = "resolved", &kami.Resolution{Answer: req.Answer, By: "human"}
+		env(w, kami.ContractView{Contract: c}, "", "")
 	})
 	return m
 }
@@ -151,12 +164,13 @@ type call struct {
 	Form   url.Values
 }
 
-// fakeSlack answers the Web API methods kami-slack uses and records each call.
+// fakeSlack answers the Web API methods power uses and records each call.
 type fakeSlack struct {
 	mu      sync.Mutex
 	calls   []call
 	n       int
 	replies map[string][]map[string]any // thread ts -> conversations.replies messages
+	url     string
 }
 
 func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +206,19 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if to < len(msgs) {
 			out["response_metadata"] = map[string]any{"next_cursor": strconv.Itoa(to)}
 		}
-	case "canvases.edit", "canvases.access.set", "reactions.add":
+	case "users.info":
+		out = map[string]any{"user": map[string]any{"id": r.Form.Get("user"), "profile": map[string]any{"display_name": "name-" + r.Form.Get("user")}}}
+	case "files.getUploadURLExternal":
+		out = map[string]any{"upload_url": "http://" + r.Host + "/upload", "file_id": "FPIC"}
+	case "upload":
+		w.Write([]byte("OK"))
+		return
+	case "private/F9.png": // an attached file's url_private_download
+		w.Write([]byte("\x89PNG fake"))
+		return
+	case "files.completeUploadExternal":
+		out = map[string]any{"files": []map[string]any{{"id": "FPIC", "title": "power.gif"}}}
+	case "canvases.edit", "canvases.access.set", "reactions.add", "pins.add", "pins.remove":
 		out = map[string]any{}
 	case "files.info":
 		out = map[string]any{"file": map[string]any{"id": r.Form.Get("file"), "permalink": "https://x.slack.com/docs/T1/" + r.Form.Get("file")}}
@@ -224,7 +250,7 @@ func setup(t *testing.T) (*fakeKami, *fakeSlack, func() *adapter) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	k := &fakeKami{contracts: map[string]*engine.Contract{}, waiting: map[string]bool{}, busy: map[string]bool{}, runs: map[string]map[string]any{}}
+	k := &fakeKami{contracts: map[string]*kami.Contract{}, waiting: map[string]bool{}, busy: map[string]bool{}, runs: map[string]map[string]any{}}
 	sock := filepath.Join(dir, "k.sock")
 	l, err := net.Listen("unix", sock)
 	if err != nil {
@@ -237,10 +263,11 @@ func setup(t *testing.T) (*fakeKami, *fakeSlack, func() *adapter) {
 	t.Cleanup(ks.Close)
 	s := &fakeSlack{replies: map[string][]map[string]any{}}
 	ss := httptest.NewServer(s)
+	s.url = ss.URL
 	t.Cleanup(ss.Close)
 	start := func() *adapter {
 		a := &adapter{api: slack.New("xoxb-fake", slack.OptionAPIURL(ss.URL+"/")), kami: kamiClient(sock),
-			owner: owner, dir: filepath.Join(dir, "adapters"), chatKekkai: "work", chatWorkflow: "chat"}
+			owner: owner, dir: filepath.Join(dir, "adapters"), chatKekkai: "work", chatWorkflow: "chat", replyAnswers: true}
 		if err := a.load(); err != nil {
 			t.Fatal(err)
 		}
@@ -262,13 +289,13 @@ func reply(user, thread, ts, text string) *slackevents.MessageEvent {
 func TestServe(t *testing.T) {
 	ctx := context.Background()
 	k, s, start := setup(t)
-	k.contracts["c1"] = &engine.Contract{ID: "c1", RunID: "r1", Step: "review", Kind: "choice", Title: "Keep the draft?",
+	k.contracts["c1"] = &kami.Contract{ID: "c1", RunID: "r1", Step: "review", Kind: "choice", Title: "Keep the draft?",
 		Body: "three lines about tea", Options: []string{"keep", "redo"}, Default: "keep", Status: "open", Lock: true}
-	k.contracts["c2"] = &engine.Contract{ID: "c2", RunID: "r1", Step: "rate", Kind: "form", Title: "Rate it",
+	k.contracts["c2"] = &kami.Contract{ID: "c2", RunID: "r1", Step: "rate", Kind: "form", Title: "Rate it",
 		Fields: map[string]string{"rating": "enum:good,bad"}, Options: []string{"rated"}, Status: "open"}
-	k.contracts["c3"] = &engine.Contract{ID: "c3", RunID: "r2", Kind: "ask", Title: "Which port?", Status: "open"}
+	k.contracts["c3"] = &kami.Contract{ID: "c3", RunID: "r2", Kind: "ask", Title: "Which port?", Status: "open"}
 	for i, id := range []string{"c1", "c2", "c3"} {
-		k.events = append(k.events, eventbus.Event{ID: int64(i + 1), Type: "contract.opened", Data: map[string]any{"id": id}})
+		k.events = append(k.events, kami.Event{ID: int64(i + 1), Type: "contract.opened", Data: map[string]any{"id": id}})
 	}
 	must := func(err error) {
 		t.Helper()
@@ -324,7 +351,7 @@ func TestServe(t *testing.T) {
 		t.Fatalf("refusal = %v", l)
 	}
 	must(a.onMessage(ctx, reply(owner, "100.2", "200.3", "Rated rating=good")))
-	if k.resolves[2] != "c2=rated map[rating:good]" || last().Get("text") != "✓ resolved → rated" {
+	if k.resolves[2] != "c2=rated map[rating:good]" || last().Get("text") != "✓ Got it: rated. POWER approves." {
 		t.Fatalf("form: resolves %v last %v", k.resolves, last())
 	}
 
@@ -335,14 +362,14 @@ func TestServe(t *testing.T) {
 	// our own resolutions get no follow-up; one by the AFK resolver does
 	k.mu.Lock()
 	k.events = append(k.events,
-		eventbus.Event{ID: 4, Type: "contract.resolved", Data: map[string]any{"id": "c1", "answer": "keep", "by": "human"}},
-		eventbus.Event{ID: 5, Type: "contract.resolved", Data: map[string]any{"id": "c2", "answer": "rated", "by": "human"}},
-		eventbus.Event{ID: 6, Type: "contract.resolved", Data: map[string]any{"id": "c3", "answer": "8080", "by": "resolver"}})
+		kami.Event{ID: 4, Type: "contract.resolved", Data: map[string]any{"id": "c1", "answer": "keep", "by": "human"}},
+		kami.Event{ID: 5, Type: "contract.resolved", Data: map[string]any{"id": "c2", "answer": "rated", "by": "human"}},
+		kami.Event{ID: 6, Type: "contract.resolved", Data: map[string]any{"id": "c3", "answer": "8080", "by": "resolver"}})
 	k.mu.Unlock()
 	before := len(s.of("chat.postMessage"))
 	must(a.events(ctx))
 	if p := s.of("chat.postMessage"); len(p) != before+1 || p[before].Get("thread_ts") != "100.3" ||
-		!strings.Contains(p[before].Get("text"), "resolved by resolver → 8080") || len(a.st.Threads) != 0 {
+		!strings.Contains(p[before].Get("text"), "resolver already answered: 8080") || len(a.st.Threads) != 0 {
 		t.Fatalf("follow-ups = %v threads %v", p[before:], a.st.Threads)
 	}
 }
@@ -351,11 +378,11 @@ func TestCanvasAndDM(t *testing.T) {
 	ctx := context.Background()
 	_, s, start := setup(t)
 	a := start()
-	u1, err := a.canvas(ctx, "weekly", "Weekly", "# one")
+	u1, err := a.canvas(ctx, "weekly", "Weekly", "# one", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	u2, err := a.canvas(ctx, "weekly", "Weekly", "# two")
+	u2, err := a.canvas(ctx, "weekly", "Weekly", "# two", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +399,7 @@ func TestCanvasAndDM(t *testing.T) {
 	if _, ts, err := a.post(ctx, entry{Kind: "thread_reply", ThreadTS: "100.9", Text: "in thread"}, nil); err != nil || s.of("chat.postMessage")[0].Get("thread_ts") != "100.9" || ts == "" {
 		t.Fatalf("dm --thread: %v %v", err, s.of("chat.postMessage"))
 	}
-	if _, err := a.canvas(ctx, "../x", "t", ""); err == nil {
+	if _, err := a.canvas(ctx, "../x", "t", "", nil); err == nil {
 		t.Fatal("a path-like key was accepted")
 	}
 	ch, ts, err := a.post(ctx, entry{Kind: "dm", Text: "hello"}, nil)
@@ -382,13 +409,13 @@ func TestCanvasAndDM(t *testing.T) {
 }
 
 func TestParseReply(t *testing.T) {
-	form := &engine.ContractView{Contract: &engine.Contract{Options: []string{"rated"},
+	form := &kami.ContractView{Contract: &kami.Contract{Options: []string{"rated"},
 		Fields: map[string]string{"rating": "enum:good,bad", "replay": "bool", "note": "string?"}}}
 	ans, data := parseReply(form, `Rated rating=good replay=true note="two words"`)
 	if ans != "rated" || data["rating"] != "good" || data["replay"] != true || data["note"] != "two words" {
 		t.Fatalf("form = %q %v", ans, data)
 	}
-	ask := &engine.ContractView{Contract: &engine.Contract{Kind: "ask"}}
+	ask := &kami.ContractView{Contract: &kami.Contract{Kind: "ask"}}
 	if ans, _ := parseReply(ask, unslack("  see <https://x.io/a?b=1&amp;c=2|x.io> port=8080 ")); ans != "see https://x.io/a?b=1&c=2 port=8080" {
 		t.Fatalf("ask = %q", ans)
 	}
@@ -412,8 +439,14 @@ func TestChat(t *testing.T) {
 		t.Fatal("non-owner DM routed")
 	}
 
+	// an earlier chat in this thread went to sleep: the new run resumes its session
+	k.runs["06old"] = map[string]any{"workflow": "chat", "vars": map[string]any{"thread_ts": "300.1", "kami_thread": "300.1"}, "sessions": map[string]any{"think": "claude:s-old"}}
 	// top-level DM: 👀, signal (nobody waiting), no run owns it → a run starts under the message itself
 	must(a.onMessage(ctx, reply(owner, "", "300.1", "deploy &lt;staging&gt;")))
+	if ss, _ := inputs(0)["kami_sessions"].(map[string]any); ss["think"] != "claude:s-old" {
+		t.Fatalf("kami_sessions = %v", inputs(0)["kami_sessions"])
+	}
+	delete(k.runs, "06old")
 	if r := s.of("reactions.add"); len(r) != 1 || r[0].Get("name") != "eyes" || r[0].Get("timestamp") != "300.1" || r[0].Get("channel") != "D1" {
 		t.Fatalf("reaction = %v", r)
 	}
@@ -442,6 +475,18 @@ func TestChat(t *testing.T) {
 	if q := a.st.Queue["300.1"]; len(q) != 2 || q[0].Text != "one" || q[1].Text != "two" || len(k.started) != 1 {
 		t.Fatalf("busy: queue %v started %d", q, len(k.started))
 	}
+	// parked on its own question (wrap up?): the new message answers it with the last option
+	k.contracts["cw1"] = &kami.Contract{ID: "cw1", RunID: "run-300.1", Origin: "state", Step: "confirm_wrap", Kind: "choice", Title: "Wrap up?",
+		Options: []string{"unpin_and_wrap", "keep_going"}, Status: "open"}
+	// …but never a question the worker raised itself, whatever its options
+	k.contracts["cx1"] = &kami.Contract{ID: "cx1", RunID: "run-300.1", Origin: "worker", Kind: "choice", Title: "Push?",
+		Options: []string{"no", "yes, push"}, Status: "open"}
+	n := len(k.resolves)
+	a.routeAll(ctx)
+	if got := k.resolves[n:]; len(got) != 1 || got[0] != "cw1=keep_going map[]" {
+		t.Fatalf("superseded = %v", got)
+	}
+	delete(k.contracts, "cx1")
 	a = start() // the queue survives a restart
 	k.waiting["300.1"] = true
 	a.routeAll(ctx)
@@ -477,9 +522,9 @@ func TestChat(t *testing.T) {
 func TestTranscript(t *testing.T) {
 	ctx := context.Background()
 	k, _, start := setup(t)
-	k.contracts["c1"] = &engine.Contract{ID: "c1", RunID: "r1", Kind: "choice", Title: "Keep?", Options: []string{"keep", "redo"}, Status: "open"}
-	k.contracts["c2"] = &engine.Contract{ID: "c2", RunID: "r2", Kind: "ask", Title: "Port?", Status: "open"}
-	k.events = []eventbus.Event{{ID: 1, Type: "contract.opened", Data: map[string]any{"id": "c1"}},
+	k.contracts["c1"] = &kami.Contract{ID: "c1", RunID: "r1", Kind: "choice", Title: "Keep?", Options: []string{"keep", "redo"}, Status: "open"}
+	k.contracts["c2"] = &kami.Contract{ID: "c2", RunID: "r2", Kind: "ask", Title: "Port?", Status: "open"}
+	k.events = []kami.Event{{ID: 1, Type: "contract.opened", Data: map[string]any{"id": "c1"}},
 		{ID: 2, Type: "contract.opened", Data: map[string]any{"id": "c2"}}}
 	a := start()
 	a.run = "rstep"
@@ -501,7 +546,7 @@ func TestTranscript(t *testing.T) {
 	if _, _, err := a.post(ctx, entry{Kind: "dm", Text: "line one\nline two"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.canvas(ctx, "", "Weekly", "# body"); err != nil {
+	if _, err := a.canvas(ctx, "", "Weekly", "# body", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -548,7 +593,7 @@ func TestTranscript(t *testing.T) {
 	if e := find("thread_reply", 0); e.Dir != "in" || e.ContractID != "c2" || e.RunID != "r2" || e.Text != "8080" || e.ThreadTS != "100.2" || e.User != owner {
 		t.Fatalf("thread reply = %+v", e)
 	}
-	if e := find("followup", 0); e.ThreadTS != "100.2" || e.ContractID != "c2" || e.Text != "✓ resolved → 8080" || e.User != "" {
+	if e := find("followup", 0); e.ThreadTS != "100.2" || e.ContractID != "c2" || e.Text != "✓ Got it: 8080. POWER approves." || e.User != "" {
 		t.Fatalf("followup = %+v", e)
 	}
 	started, queued, signalled := find("chat_routed", 0), find("chat_routed", 1), find("chat_routed", 2)
@@ -735,13 +780,13 @@ func TestRunThreads(t *testing.T) {
 	k.runs["rc"] = map[string]any{"id": "rc", "workflow": "lint", "parent": "rp", "vars": map[string]any{}}
 	k.runs["rn"] = map[string]any{"id": "rn", "workflow": "solo", "vars": map[string]any{}}
 	k.runs["rq"] = map[string]any{"id": "rq", "workflow": "release", "vars": map[string]any{"thread_ts": "800.1"}}
-	k.contracts["c1"] = &engine.Contract{ID: "c1", RunID: "rc", Origin: "state", Kind: "ask", Title: "Which port?", Status: "open"}
-	k.contracts["cN"] = &engine.Contract{ID: "cN", RunID: "rn", Origin: "state", Kind: "choice", Title: "Keep?", Options: []string{"keep", "redo"}, Status: "open"}
-	k.contracts["c5"] = &engine.Contract{ID: "c5", RunID: "rq", Origin: "engine", Kind: "blocker", Title: "Ship?", Options: []string{"ship", "hold"}, Status: "open"}
-	ev := func(id int64, typ, run string, data map[string]any) eventbus.Event {
-		return eventbus.Event{ID: id, TS: now, Type: typ, Run: run, Data: data}
+	k.contracts["c1"] = &kami.Contract{ID: "c1", RunID: "rc", Origin: "state", Kind: "ask", Title: "Which port?", Status: "open"}
+	k.contracts["cN"] = &kami.Contract{ID: "cN", RunID: "rn", Origin: "state", Kind: "choice", Title: "Keep?", Options: []string{"keep", "redo"}, Status: "open"}
+	k.contracts["c5"] = &kami.Contract{ID: "c5", RunID: "rq", Origin: "engine", Kind: "blocker", Title: "Ship?", Options: []string{"ship", "hold"}, Status: "open"}
+	ev := func(id int64, typ, run string, data map[string]any) kami.Event {
+		return kami.Event{ID: id, TS: now, Type: typ, Run: run, Data: data}
 	}
-	k.events = []eventbus.Event{
+	k.events = []kami.Event{
 		ev(1, "contract.opened", "rc", map[string]any{"id": "c1"}),
 		ev(2, "contract.opened", "rn", map[string]any{"id": "cN"}),
 		ev(3, "run.started", "rc", map[string]any{"workflow": "lint", "parent": "rp"}),
@@ -768,14 +813,24 @@ func TestRunThreads(t *testing.T) {
 	for _, p := range s.of("chat.postMessage") {
 		got = append(got, post{p.Get("thread_ts"), strings.SplitN(p.Get("text"), "\n", 3)[min(1, strings.Count(p.Get("text"), "\n"))]})
 	}
-	want := []post{{"700.1", "*Which port?*"}, {"", "*Keep?*"}, {"700.1", "↳ started lint"}, {"700.1", "lint: 3 files"},
-		{"700.1", "✅ lint: clean"}, {"700.1", "❌ build failed: lint broke"}, {"800.1", "*Ship?*"}}
+	// rp's milestones and its child's go on one pinned card; only rp's result posts
+	want := []post{{"700.1", "*Which port?*"}, {"", "*Keep?*"}, {"700.1", "• ↳ lint `rc`: started"},
+		{"700.1", "❌ build failed: lint broke. Not POWER's fault!"}, {"800.1", "*Ship?*"}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("posts:\n got %v\nwant %v", got, want)
 	}
 	posts := s.of("chat.postMessage")
-	if !strings.Contains(posts[6].Get("blocks"), `"action_id":"kami:c5:0"`) || a.st.Since != 12 {
-		t.Fatalf("c5 in its thread lost its buttons: %v (since %d)", posts[6], a.st.Since)
+	if !strings.Contains(posts[4].Get("blocks"), `"action_id":"kami:c5:0"`) || a.st.Since != 12 {
+		t.Fatalf("c5 in its thread lost its buttons: %v (since %d)", posts[4], a.st.Since)
+	}
+	ups := s.of("chat.update")
+	if card := ups[len(ups)-1]; card.Get("ts") != posts[2].Get("ts") && card.Get("ts") != "100.3" ||
+		!strings.Contains(card.Get("text"), "• ↳ lint `rc`: ✅ lint: clean. POWER wins again!") || !strings.Contains(card.Get("text"), "*❌ failed*") ||
+		strings.Count(card.Get("text"), "↳") != 1 {
+		t.Fatalf("card = %v", card)
+	}
+	if p := s.of("pins.add"); len(p) != 0 {
+		t.Fatalf("cards are not pinned: %v", p)
 	}
 	if th := a.st.Threads; th["c1"].Thread != "700.1" || th["c1"].TS != "100.1" || th["cN"].Thread != "" || th["c5"].Thread != "800.1" {
 		t.Fatalf("threads = %+v %+v %+v", th["c1"], th["cN"], th["c5"])
@@ -790,14 +845,21 @@ func TestRunThreads(t *testing.T) {
 			t.Fatalf("contract entry = %+v", e)
 		}
 	}
-	if strings.Join(ms, " ") != "rc/lint@700.1 rc/lint@700.1 rc/lint@700.1 rp/build@700.1" {
+	if strings.Join(ms, " ") != "rp/build@700.1" {
 		t.Fatalf("milestone entries = %v", ms)
 	}
+
+	// the top-level run that finished in the thread is told to the chat listening there
+	if len(k.signals) != 1 || k.signals[0]["key"] != "700.1" ||
+		k.signals[0]["data"].(map[string]any)["text"] != "[kami] build failed: lint broke. Not POWER's fault! (run rp)" {
+		t.Fatalf("finish signals = %v", k.signals)
+	}
+	k.signals = nil
 
 	last := func() url.Values { p := s.of("chat.postMessage"); return p[len(p)-1] }
 	// a reply in the run thread answers its one open ask
 	must(a.onMessage(ctx, reply(owner, "700.1", "701.1", "use port 8080")))
-	if len(k.resolves) != 1 || k.resolves[0] != "c1=use port 8080 map[]" || last().Get("thread_ts") != "700.1" || last().Get("text") != "✓ resolved → use port 8080" {
+	if len(k.resolves) != 1 || k.resolves[0] != "c1=use port 8080 map[]" || last().Get("thread_ts") != "700.1" || last().Get("text") != "✓ Got it: use port 8080. POWER approves." {
 		t.Fatalf("ask in run thread: resolves %v last %v", k.resolves, last())
 	}
 	if len(k.signals) != 0 {
@@ -826,8 +888,8 @@ func TestRunThreads(t *testing.T) {
 	}
 
 	// two text-taking contracts in one thread: ambiguous → chat
-	k.contracts["c2"] = &engine.Contract{ID: "c2", RunID: "rc", Origin: "state", Kind: "ask", Title: "Name?", Status: "open"}
-	k.contracts["c3"] = &engine.Contract{ID: "c3", RunID: "rp", Origin: "state", Kind: "form", Title: "Rate", Fields: map[string]string{"rating": "enum:good,bad"}, Status: "open"}
+	k.contracts["c2"] = &kami.Contract{ID: "c2", RunID: "rc", Origin: "state", Kind: "ask", Title: "Name?", Status: "open"}
+	k.contracts["c3"] = &kami.Contract{ID: "c3", RunID: "rp", Origin: "state", Kind: "form", Title: "Rate", Fields: map[string]string{"rating": "enum:good,bad"}, Status: "open"}
 	k.mu.Lock()
 	k.events = append(k.events, ev(13, "contract.opened", "rc", map[string]any{"id": "c2"}), ev(14, "contract.opened", "rp", map[string]any{"id": "c3"}))
 	k.mu.Unlock()
@@ -842,8 +904,26 @@ func TestRunThreads(t *testing.T) {
 	k.events = append(k.events, ev(15, "contract.cancelled", "rc", map[string]any{"id": "c2"}))
 	k.mu.Unlock()
 	must(a.events(ctx))
-	if l := last(); l.Get("thread_ts") != "700.1" || !strings.Contains(l.Get("text"), "cancelled") {
+	if l := last(); l.Get("thread_ts") != "700.1" || !strings.Contains(l.Get("text"), "Cancelled") {
 		t.Fatalf("follow-up = %v", l)
+	}
+
+	// a card read back from the state file (children omitted while empty) still takes a child line
+	a.save()
+	a = start()
+	a.st.Cards["rp"].Children = nil
+	must(a.onCard(ctx, "rp", link{thread: "700.1", workflow: "build", root: "rp"},
+		kami.Event{Run: "rz", Type: "run.started"}, "late", "↳ POWER started late"))
+
+	// an AFK answer in rp's tree goes on rp's card, not into a message of its own
+	n := len(s.of("chat.postMessage"))
+	k.mu.Lock()
+	k.events = append(k.events, ev(16, "contract.resolved", "rp", map[string]any{"id": "c3", "by": "resolver", "answer": "good\nbecause"}))
+	k.mu.Unlock()
+	must(a.events(ctx))
+	ups = s.of("chat.update")
+	if len(s.of("chat.postMessage")) != n || !strings.Contains(ups[len(ups)-1].Get("text"), "• 🤖 AFK answered: good …") {
+		t.Fatalf("afk on card: posts %d→%d, last update %v", n, len(s.of("chat.postMessage")), ups[len(ups)-1])
 	}
 }
 
@@ -857,8 +937,8 @@ func TestBadRunThread(t *testing.T) {
 	ctx := context.Background()
 	k, s, start := setup(t)
 	k.runs["rb"] = map[string]any{"id": "rb", "workflow": "ping", "vars": map[string]any{"thread_ts": "999.9"}}
-	k.contracts["c1"] = &engine.Contract{ID: "c1", RunID: "rb", Origin: "state", Kind: "ask", Title: "Port?", Status: "open"}
-	k.events = []eventbus.Event{
+	k.contracts["c1"] = &kami.Contract{ID: "c1", RunID: "rb", Origin: "state", Kind: "ask", Title: "Port?", Status: "open"}
+	k.events = []kami.Event{
 		{ID: 1, TS: time.Now(), Type: "run.say", Run: "rb", Data: map[string]any{"text": "hi"}},
 		{ID: 2, TS: time.Now(), Type: "contract.opened", Run: "rb", Data: map[string]any{"id": "c1"}},
 	}
@@ -876,8 +956,8 @@ func TestWorkerAskInRunThread(t *testing.T) {
 	ctx := context.Background()
 	k, s, start := setup(t)
 	k.runs["rg"] = map[string]any{"id": "rg", "workflow": "goal", "vars": map[string]any{"thread_ts": "900.1"}}
-	k.contracts["cw"] = &engine.Contract{ID: "cw", RunID: "rg", Origin: "worker", Kind: "ask", Title: "Which repo?", Status: "open"}
-	k.events = []eventbus.Event{{ID: 1, TS: time.Now(), Type: "contract.opened", Run: "rg", Data: map[string]any{"id": "cw"}}}
+	k.contracts["cw"] = &kami.Contract{ID: "cw", RunID: "rg", Origin: "worker", Kind: "ask", Title: "Which repo?", Status: "open"}
+	k.events = []kami.Event{{ID: 1, TS: time.Now(), Type: "contract.opened", Run: "rg", Data: map[string]any{"id": "cw"}}}
 	a := start()
 	if err := a.events(ctx); err != nil {
 		t.Fatal(err)
@@ -885,9 +965,159 @@ func TestWorkerAskInRunThread(t *testing.T) {
 	if err := a.onMessage(ctx, reply(owner, "900.1", "901.1", "the kami repo")); err != nil {
 		t.Fatal(err)
 	}
+	// without --reply-answers the same reply goes to chat, with the thread's open contracts
+	a.replyAnswers = false
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(a.onMessage(ctx, reply(owner, "900.1", "901.2", "how is it going?")))
+	if len(k.resolves) != 1 || len(k.signals) != 1 || k.signals[0]["data"].(map[string]any)["thread_contracts"] != "cw" ||
+		len(k.started) != 1 || inputsOf(k, 0)["thread_contracts"] != "cw" {
+		t.Fatalf("chat routing: resolves %v signals %v started %v", k.resolves, k.signals, k.started)
+	}
 	p := s.of("chat.postMessage")
-	if len(k.resolves) != 1 || k.resolves[0] != "cw=the kami repo map[]" || len(k.signals) != 0 || len(k.started) != 0 ||
-		p[len(p)-1].Get("thread_ts") != "900.1" || p[len(p)-1].Get("text") != "✓ resolved → the kami repo" {
+	if len(k.resolves) != 1 || k.resolves[0] != "cw=the kami repo map[]" ||
+		p[len(p)-1].Get("thread_ts") != "900.1" || p[len(p)-1].Get("text") != "✓ Got it: the kami repo. POWER approves." {
 		t.Fatalf("worker ask: resolves %v signals %v last %v", k.resolves, k.signals, p[len(p)-1])
+	}
+}
+
+func TestCoworkers(t *testing.T) {
+	ctx := context.Background()
+	k, s, start := setup(t)
+	a := start()
+	a.coworkers, a.mrWorkflow, a.convWorkflow, a.botUser = true, "mr", "converse", "UPOWER"
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ch := func(user, ts, text string) *slackevents.MessageEvent {
+		return &slackevents.MessageEvent{ChannelType: "channel", Channel: "C1", User: user, TimeStamp: ts, Text: text}
+	}
+
+	// an MR link in a channel: one question with two buttons in its thread; the app_mention twin is dropped
+	link := "<https://gitlab.com/acme/web/-/merge_requests/42|!42>"
+	must(a.onMessage(ctx, ch("UBOB", "10.1", "<@UPOWER> look "+link)))
+	must(a.onCoworker(ctx, coMsg{"UBOB", "look " + link, "C1", "10.1", "", "channel"}))
+	posts := s.of("chat.postMessage")
+	if len(posts) != 1 || posts[0].Get("channel") != "C1" || posts[0].Get("thread_ts") != "10.1" ||
+		!strings.Contains(posts[0].Get("blocks"), "power:review") || !strings.Contains(posts[0].Get("blocks"), "power:approve") {
+		t.Fatalf("posts = %v", posts)
+	}
+	val, _ := json.Marshal(mrAsk{URL: "https://gitlab.com/acme/web/-/merge_requests/42", Requester: "UBOB", Channel: "C1", Thread: "10.1"})
+
+	// someone else's tap does nothing; the requester's starts the mr workflow and redraws
+	must(a.onMRTap(ctx, "UEVE", "C1", "100.1", "approve", string(val)))
+	if len(k.started) != 0 {
+		t.Fatal("a stranger's tap started a run")
+	}
+	must(a.onMRTap(ctx, "UBOB", "C1", "100.1", "approve", string(val)))
+	if len(k.started) != 1 || k.started[0]["workflow"] != "mr" {
+		t.Fatalf("started = %v", k.started)
+	}
+	if in := k.started[0]["inputs"].(map[string]any); in["action"] != "approve" || in["reply_ts"] != "10.1" || in["requester"] != "UBOB" ||
+		in["url"] != "https://gitlab.com/acme/web/-/merge_requests/42" {
+		t.Fatalf("inputs = %v", in)
+	}
+	if u := s.of("chat.update"); len(u) != 1 || strings.Contains(u[0].Get("blocks"), "power:") {
+		t.Fatalf("redraw = %v", u)
+	}
+
+	// anything else goes to its conversation's session: a DM with a coworker…
+	must(a.onMessage(ctx, reply("UBOB", "", "11.1", "hi")))
+	in := k.started[1]["inputs"].(map[string]any)
+	if k.started[1]["workflow"] != "converse" || in["kami_conv"] != "dm" || in["kami_peer"] != "UBOB" || in["kami_key"] != "dm:D1" ||
+		in["kami_reply_ts"] != "" || in["owner_msg"] != false || in["from_name"] != "name-UBOB" || !strings.Contains(in["place"].(string), "DM") {
+		t.Fatalf("dm session = %v", k.started[1])
+	}
+	// …a channel's main conversation (the owner, here)…
+	must(a.onMessage(ctx, ch(owner, "12.1", "<@UPOWER> you there?")))
+	in = k.started[2]["inputs"].(map[string]any)
+	if in["kami_conv"] != "group" || in["kami_key"] != "chan:C1" || in["owner_msg"] != true || in["kami_peer"] != nil || in["text"] != "<@UPOWER> you there?" {
+		t.Fatalf("channel session = %v", k.started[2])
+	}
+	// …and a channel thread, which carries the thread so far with names
+	s.replies["30.1"] = []map[string]any{{"ts": "30.1", "user": "UBOB", "text": "ship it?"},
+		{"ts": "30.2", "bot_id": "B1", "text": "never"}, {"ts": "30.3", "user": owner, "text": "<@UPOWER> be nice"}}
+	must(a.onCoworker(ctx, coMsg{owner, "<@UPOWER> be nice", "C1", "30.3", "30.1", "channel"}))
+	in = k.started[3]["inputs"].(map[string]any)
+	if in["kami_key"] != "thr:C1:30.1" || in["kami_reply_ts"] != "30.1" || in["history"] != "name-UBOB: ship it?\nPOWER (you): never" {
+		t.Fatalf("thread session = %v", in)
+	}
+	// a waiting session gets the next message as a signal; a busy one queues it, then one labeled turn
+	k.waiting["dm:D1"] = true
+	must(a.onMessage(ctx, reply("UBOB", "", "11.2", "again")))
+	if last := k.signals[len(k.signals)-1]; last["key"] != "dm:D1" || last["data"].(map[string]any)["text"] != "again" || len(k.started) != 4 {
+		t.Fatalf("signal = %v started %d", last, len(k.started))
+	}
+	k.busy["dm:D1"] = true
+	must(a.onMessage(ctx, reply("UBOB", "", "11.3", "one")))
+	must(a.onMessage(ctx, reply("UBOB", "", "11.4", "two")))
+	if len(a.st.Convs["dm:D1"]) != 2 || len(k.started) != 4 {
+		t.Fatalf("busy: queue %v started %d", a.st.Convs["dm:D1"], len(k.started))
+	}
+	delete(k.busy, "dm:D1")
+	k.waiting["dm:D1"] = true
+	a.routeConvs(ctx)
+	if last := k.signals[len(k.signals)-1]; last["data"].(map[string]any)["text"] != "name-UBOB: one\nname-UBOB: two" || len(a.st.Convs) != 0 {
+		t.Fatalf("drain = %v queue %v", last, a.st.Convs)
+	}
+
+	// channel chatter that neither mentions her nor is in a conversation she is in: ignored
+	n0 := len(k.started)
+	must(a.onMessage(ctx, ch("UBOB", "40.1", "lunch anyone?")))
+	if len(k.started) != n0 || len(a.st.Convs) != 0 {
+		t.Fatalf("chatter routed: started %d→%d", n0, len(k.started))
+	}
+
+	// past the daily cap: a canned line, no Claude; the owner is never capped
+	for i := 0; i < banterPerDay; i++ {
+		must(a.onMessage(ctx, ch("UEVE", fmt.Sprintf("20.%d", i), "<@UPOWER> spam")))
+	}
+	n := len(k.started)
+	must(a.onMessage(ctx, ch("UEVE", "21.1", "<@UPOWER> spam")))
+	if p := s.of("chat.postMessage"); len(k.started) != n || p[len(p)-1].Get("text") != "i only answer to the owner, bruh" {
+		t.Fatalf("cap: started %d→%d, last %v", n, len(k.started), p[len(p)-1])
+	}
+
+	// off: a non-owner DM is ignored again
+	a.coworkers = false
+	must(a.onMessage(ctx, reply("UBOB", "", "13.1", "hi")))
+	if len(k.started) != n {
+		t.Fatal("coworker answered with the flag off")
+	}
+}
+
+// An owner's DM with an image reaches the chat with the saved image's path; upload sends to a person's DM.
+func TestOwnerImage(t *testing.T) {
+	ctx := context.Background()
+	k, s, start := setup(t)
+	a := start()
+	m := reply(owner, "", "400.1", "send baha this")
+	m.SubType = "file_share"
+	m.Message = &slack.Msg{Files: []slack.File{
+		{ID: "F9", Name: "../../evil.png", Size: 10, URLPrivateDownload: s.url + "/private/F9.png"},
+		{ID: "F8", Name: "notes.pdf", Size: 10, URLPrivateDownload: s.url + "/private/F8.pdf"},
+	}}
+	if err := a.onMessage(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(a.dir, "files", "400.1-F9.png")
+	if len(k.started) != 1 || k.started[0]["inputs"].(map[string]any)["text"] != "send baha this\n[image attached: "+path+"]" {
+		t.Fatalf("started = %v", k.started)
+	}
+	if raw, err := os.ReadFile(path); err != nil || string(raw) != "\x89PNG fake" {
+		t.Fatalf("saved image: %q %v", raw, err)
+	}
+	if err := a.upload(ctx, "U2", "", path); err != nil {
+		t.Fatal(err)
+	}
+	if o := s.of("conversations.open"); len(o) == 0 || o[len(o)-1].Get("users") != "U2" {
+		t.Fatalf("conversations.open = %v", o)
 	}
 }
