@@ -358,6 +358,12 @@ func (a *adapter) upload(ctx context.Context, channel, thread, path string) erro
 	if channel == "" {
 		channel, err = a.dm(ctx)
 	}
+	if strings.HasPrefix(channel, "U") || strings.HasPrefix(channel, "W") { // a person: their DM with POWER
+		var ch *slack.Channel
+		if ch, _, _, err = a.api.OpenConversationContext(ctx, &slack.OpenConversationParameters{Users: []string{channel}}); err == nil {
+			channel = ch.ID
+		}
+	}
 	e := entry{Dir: "out", Kind: "picture", Channel: channel, ThreadTS: thread, Text: path}
 	switch strings.ToLower(filepath.Ext(path)) { // pictures only: never a way to post an arbitrary file
 	case ".gif", ".png", ".jpg", ".jpeg", ".webp":

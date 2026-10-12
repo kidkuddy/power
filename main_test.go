@@ -171,6 +171,7 @@ type fakeSlack struct {
 	calls   []call
 	n       int
 	replies map[string][]map[string]any // thread ts -> conversations.replies messages
+	url     string
 }
 
 func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -212,6 +213,9 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		out = map[string]any{"upload_url": "http://" + r.Host + "/upload", "file_id": "FPIC"}
 	case "upload":
 		w.Write([]byte("OK"))
+		return
+	case "private/F9.png": // an attached file's url_private_download
+		w.Write([]byte("\x89PNG fake"))
 		return
 	case "files.completeUploadExternal":
 		out = map[string]any{"files": []map[string]any{{"id": "FPIC", "title": "power.gif"}}}
@@ -260,6 +264,7 @@ func setup(t *testing.T) (*fakeKami, *fakeSlack, func() *adapter) {
 	t.Cleanup(ks.Close)
 	s := &fakeSlack{replies: map[string][]map[string]any{}}
 	ss := httptest.NewServer(s)
+	s.url = ss.URL
 	t.Cleanup(ss.Close)
 	start := func() *adapter {
 		a := &adapter{api: slack.New("xoxb-fake", slack.OptionAPIURL(ss.URL+"/")), kami: kamiClient(sock),
@@ -1086,5 +1091,34 @@ func TestCoworkers(t *testing.T) {
 	must(a.onMessage(ctx, reply("UBOB", "", "13.1", "hi")))
 	if len(k.started) != n {
 		t.Fatal("coworker answered with the flag off")
+	}
+}
+
+// An owner's DM with an image reaches the chat with the saved image's path; upload sends to a person's DM.
+func TestOwnerImage(t *testing.T) {
+	ctx := context.Background()
+	k, s, start := setup(t)
+	a := start()
+	m := reply(owner, "", "400.1", "send baha this")
+	m.SubType = "file_share"
+	m.Message = &slack.Msg{Files: []slack.File{
+		{ID: "F9", Name: "../../evil.png", Size: 10, URLPrivateDownload: s.url + "/private/F9.png"},
+		{ID: "F8", Name: "notes.pdf", Size: 10, URLPrivateDownload: s.url + "/private/F8.pdf"},
+	}}
+	if err := a.onMessage(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(a.dir, "files", "400.1-F9.png")
+	if len(k.started) != 1 || k.started[0]["inputs"].(map[string]any)["text"] != "send baha this\n[image attached: "+path+"]" {
+		t.Fatalf("started = %v", k.started)
+	}
+	if raw, err := os.ReadFile(path); err != nil || string(raw) != "\x89PNG fake" {
+		t.Fatalf("saved image: %q %v", raw, err)
+	}
+	if err := a.upload(ctx, "U2", "", path); err != nil {
+		t.Fatal(err)
+	}
+	if o := s.of("conversations.open"); len(o) == 0 || o[len(o)-1].Get("users") != "U2" {
+		t.Fatalf("conversations.open = %v", o)
 	}
 }

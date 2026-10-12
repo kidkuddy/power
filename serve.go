@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -447,6 +449,44 @@ func (a *adapter) onAction(ctx context.Context, cb slack.InteractionCallback) er
 	return nil
 }
 
+// keepImages saves the images attached to an owner's message under <data>/files, so the chat
+// can look at them and forward them, and returns their paths as lines for the text.
+func (a *adapter) keepImages(ctx context.Context, m *slackevents.MessageEvent) string {
+	if m.Message == nil {
+		return ""
+	}
+	var lines strings.Builder
+	for _, f := range m.Message.Files {
+		ext := strings.ToLower(filepath.Ext(f.Name))
+		switch ext {
+		case ".gif", ".png", ".jpg", ".jpeg", ".webp":
+		default:
+			continue
+		}
+		if f.Size > 20<<20 || f.URLPrivateDownload == "" {
+			continue
+		}
+		dir := filepath.Join(a.dir, "files")
+		path := filepath.Join(dir, m.TimeStamp+"-"+f.ID+ext) // no Slack-given name in the path
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			continue
+		}
+		out, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			continue
+		}
+		err = a.api.GetFileContext(ctx, f.URLPrivateDownload, out)
+		out.Close()
+		if err != nil {
+			os.Remove(path)
+			a.record(entry{Dir: "in", Kind: "error", Channel: m.Channel, TS: m.TimeStamp, Error: "image download: " + err.Error()})
+			continue
+		}
+		fmt.Fprintf(&lines, "\n[image attached: %s]", path)
+	}
+	return lines.String()
+}
+
 // onMessage handles an owner's DM: a reply in a contract's thread answers the
 // contract; anything else goes to a chat run.
 func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) error {
@@ -468,12 +508,12 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 	if inThread {
 		in.Kind = "thread_reply"
 	}
-	if m.User != a.owner || (m.SubType != "" && m.SubType != "thread_broadcast") {
+	if m.User != a.owner || (m.SubType != "" && m.SubType != "thread_broadcast" && m.SubType != "file_share") {
 		in.Error = "ignored: not the owner or subtype " + m.SubType
 		a.record(in)
 		return nil
 	}
-	text := unslack(m.Text)
+	text := unslack(m.Text) + a.keepImages(ctx, m)
 	answer := func(id string, t *thread, c *engine.ContractView) error {
 		in.ContractID, in.RunID, in.Workflow = id, t.RunID, t.Workflow
 		a.record(in)
@@ -513,7 +553,7 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		}
 	}
 	a.record(in)
-	if a.chatWorkflow == "" || m.SubType != "" {
+	if a.chatWorkflow == "" || (m.SubType != "" && m.SubType != "file_share") {
 		return nil
 	}
 	key := m.TimeStamp // a top-level DM starts a thread under itself
