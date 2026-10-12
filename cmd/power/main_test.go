@@ -1081,7 +1081,7 @@ func TestCoworkers(t *testing.T) {
 	}
 	n := len(k.started)
 	must(a.onMessage(ctx, ch("UEVE", "21.1", "<@UPOWER> spam")))
-	if p := s.of("chat.postMessage"); len(k.started) != n || p[len(p)-1].Get("text") != "i only answer to the owner, bruh" {
+	if p := s.of("chat.postMessage"); len(k.started) != n || p[len(p)-1].Get("text") != "i only answer to name-uowner, bruh" {
 		t.Fatalf("cap: started %d→%d, last %v", n, len(k.started), p[len(p)-1])
 	}
 

@@ -82,7 +82,8 @@ func (a *adapter) onCoworker(ctx context.Context, m coMsg) error {
 			return err
 		}
 		if a.st.Banter[m.user] > banterPerDay { // every message is a Claude turn
-			out.Text = "i only answer to the owner, bruh"
+			owner := strings.ToLower(strings.TrimSuffix(a.name(ctx, a.owner), " (owner)"))
+			out.Text = "i only answer to " + owner + ", bruh"
 			_, _, err := a.post(ctx, out, nil)
 			return err
 		}
@@ -147,7 +148,7 @@ func (a *adapter) isCoworker(channelType, user string) bool {
 	return a.coworkers && (channelType != "im" || user != a.owner)
 }
 
-// name is a Slack user's display name ("the owner (owner)" for the owner),
+// name is a Slack user's display name ("Ada (owner)" for the owner),
 // cached; the id when the lookup fails.
 func (a *adapter) name(ctx context.Context, user string) string {
 	if n, ok := a.names[user]; ok {
