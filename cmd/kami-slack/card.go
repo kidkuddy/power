@@ -8,7 +8,7 @@ import (
 
 	"github.com/slack-go/slack"
 
-	"kami/internal/eventbus"
+	"power/internal/kami"
 )
 
 // A status card is one message per top-level run (a goal), the first reply in
@@ -43,7 +43,7 @@ func (c *card) text() string {
 
 // onCard records one milestone of the run tree rooted at rootID on its card,
 // posting and pinning the card on the first one.
-func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev eventbus.Event, workflow, text string) error {
+func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev kami.Event, workflow, text string) error {
 	c := a.st.Cards[rootID]
 	if c == nil {
 		c = &card{Thread: root.thread, Title: fmt.Sprintf("%s `%s`", root.workflow, rootID), Status: "running"}
@@ -139,7 +139,7 @@ func (a *adapter) afkOnCard(ctx context.Context, t *thread, by, answer string) (
 	} else {
 		answer = string(r)
 	}
-	return true, a.onCard(ctx, l.root, root, eventbus.Event{Run: l.root, Type: "run.say"}, root.workflow, "🤖 AFK answered: "+answer)
+	return true, a.onCard(ctx, l.root, root, kami.Event{Run: l.root, Type: "run.say"}, root.workflow, "🤖 AFK answered: "+answer)
 }
 
 func firstLineOf(s string) string {

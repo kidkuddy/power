@@ -26,7 +26,7 @@ import (
 
 	"github.com/slack-go/slack"
 
-	"kami/internal/engine"
+	"power/internal/kami"
 )
 
 const usage = `kami-slack — Kami's Slack surface (niffty's Slack app)
@@ -484,7 +484,7 @@ func (a *adapter) permalink(ctx context.Context, id string) (string, error) {
 // in that thread. A human-only contract (gate, action, lock) refuses: only
 // the owner's own button press may answer it. serve posts the follow-up.
 func (a *adapter) answer(id, answer string, data map[string]any) error {
-	var c engine.ContractView
+	var c kami.ContractView
 	if err := a.kamiCall("GET", "/contracts/"+url.PathEscape(id), nil, &c); err != nil {
 		return err
 	}
@@ -506,7 +506,7 @@ func (a *adapter) answer(id, answer string, data map[string]any) error {
 // --- Kami ----------------------------------------------------------------------
 
 // kamiErr is a refusal from the daemon (bad answer, conflict), shown to the user.
-type kamiErr struct{ engine.APIError }
+type kamiErr struct{ kami.APIError }
 
 func (e *kamiErr) Error() string { return e.Code + ": " + e.Message }
 
@@ -522,7 +522,7 @@ func (a *adapter) kamiCall(method, path string, body, out any) error {
 		return fmt.Errorf("kami: %v", err)
 	}
 	defer resp.Body.Close()
-	var env engine.Envelope
+	var env kami.Envelope
 	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
 		return fmt.Errorf("kami %s %s: %v", method, path, err)
 	}

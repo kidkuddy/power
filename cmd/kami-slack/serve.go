@@ -21,8 +21,7 @@ import (
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 
-	"kami/internal/engine"
-	"kami/internal/eventbus"
+	"power/internal/kami"
 )
 
 // serve runs the loop. Socket Mode delivers DMs and button taps down an
@@ -112,7 +111,7 @@ func (a *adapter) events(ctx context.Context) error {
 			continue // keepalive
 		}
 		var ev struct {
-			eventbus.Event
+			kami.Event
 			Error string `json:"error"`
 		}
 		if err := json.Unmarshal(line, &ev); err != nil {
@@ -154,7 +153,7 @@ const staleMilestone = 10 * time.Minute
 
 // milestone posts run.say, a child's run.started and run.finished into the
 // run's thread, one line each. A run with no thread gets nothing.
-func (a *adapter) milestone(ctx context.Context, ev eventbus.Event) error {
+func (a *adapter) milestone(ctx context.Context, ev kami.Event) error {
 	if ev.Run == "" || (!ev.TS.IsZero() && time.Since(ev.TS) > staleMilestone) {
 		return nil
 	}
@@ -175,7 +174,7 @@ func (a *adapter) milestone(ctx context.Context, ev eventbus.Event) error {
 		status, _ := ev.Data["status"].(string)
 		report, _ := ev.Data["report"].(string)
 		brag := " POWER wins again!"
-		if status == engine.StDone {
+		if status == kami.StDone {
 			text = "✅ " + l.workflow
 		} else {
 			text, brag = "❌ "+l.workflow+" "+status, " Not POWER's fault!"
@@ -292,7 +291,7 @@ func (a *adapter) threadRuns(key string) (string, error) {
 	return strings.Join(ids, ","), nil
 }
 
-func (a *adapter) handle(ctx context.Context, ev eventbus.Event) error {
+func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
 	if !followed(ev.Type) {
 		return nil
 	}
@@ -309,7 +308,7 @@ func (a *adapter) handle(ctx context.Context, ev eventbus.Event) error {
 		if t != nil {
 			return nil
 		}
-		var c engine.ContractView
+		var c kami.ContractView
 		if err := a.kamiCall("GET", "/contracts/"+url.PathEscape(id), nil, &c); err != nil {
 			return err
 		}
@@ -514,7 +513,7 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		return nil
 	}
 	text := unslack(m.Text) + a.keepImages(ctx, m)
-	answer := func(id string, t *thread, c *engine.ContractView) error {
+	answer := func(id string, t *thread, c *kami.ContractView) error {
 		in.ContractID, in.RunID, in.Workflow = id, t.RunID, t.Workflow
 		a.record(in)
 		ans, data := parseReply(c, text)
@@ -526,7 +525,7 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		if !a.replyAnswers || !inThread || t.Thread != "" || t.TS != m.ThreadTimeStamp {
 			continue
 		}
-		var c engine.ContractView
+		var c kami.ContractView
 		if err := a.kamiCall("GET", "/contracts/"+url.PathEscape(id), nil, &c); err != nil {
 			return err
 		}
@@ -534,13 +533,13 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 	}
 	if inThread && a.replyAnswers { // a run's thread: the reply answers its one open contract that takes text
 		var hit string
-		var hitView *engine.ContractView
+		var hitView *kami.ContractView
 		n := 0
 		for id, t := range a.st.Threads {
 			if t.Thread != m.ThreadTimeStamp {
 				continue
 			}
-			var c engine.ContractView
+			var c kami.ContractView
 			if err := a.kamiCall("GET", "/contracts/"+url.PathEscape(id), nil, &c); err != nil {
 				return err
 			}
@@ -735,7 +734,7 @@ var chatDont = map[string]string{"confirm": "cancel", "confirm_wrap": "keep_goin
 // supersede answers a chat run's parked question with "don't" when the owner
 // writes instead of tapping; a chat run that is busy thinking has none.
 func (a *adapter) supersede(runID string) error {
-	var open []engine.ContractView
+	var open []kami.ContractView
 	if err := a.kamiCall("GET", "/contracts?"+url.Values{"status": {"open"}, "run": {runID}}.Encode(), nil, &open); err != nil {
 		return err
 	}
@@ -820,7 +819,7 @@ func (a *adapter) repliesIn(ctx context.Context, channel, threadTS string) ([]sl
 // kami recorded, empty when kami refused.
 func (a *adapter) resolve(ctx context.Context, id string, t *thread, answer string, data map[string]any, inThread bool) (string, error) {
 	body := map[string]any{"answer": answer, "data": data, "note": "via slack (kami-slack)"}
-	var out engine.ContractView
+	var out kami.ContractView
 	err := a.kamiCall("POST", "/contracts/"+url.PathEscape(id)+"/resolve", body, &out)
 	var ke *kamiErr
 	if errors.As(err, &ke) {
@@ -857,7 +856,7 @@ func unslack(s string) string { return entities.Replace(slackURL.ReplaceAllStrin
 
 // takesText reports whether a text reply can answer c: an ask (a state's or a
 // worker's), a form, or a contract with options when the reply is one of them.
-func takesText(c *engine.ContractView, text string) bool {
+func takesText(c *kami.ContractView, text string) bool {
 	if c.Kind == "ask" || c.Kind == "form" || len(c.Fields) > 0 {
 		return true
 	}
@@ -872,7 +871,7 @@ func takesText(c *engine.ContractView, text string) bool {
 // parseReply turns a thread reply into (answer, data). Forms take
 // `answer field=value ...` (values parsed as JSON when they parse); options
 // match case-insensitively; anything else is the whole text.
-func parseReply(c *engine.ContractView, text string) (string, map[string]any) {
+func parseReply(c *kami.ContractView, text string) (string, map[string]any) {
 	text = strings.TrimSpace(text)
 	var data map[string]any
 	if len(c.Fields) > 0 {
@@ -900,7 +899,7 @@ func parseReply(c *engine.ContractView, text string) (string, map[string]any) {
 
 const maxBody = 2000 // a section block holds 3000 characters
 
-func render(c *engine.ContractView) string {
+func render(c *kami.ContractView) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "*POWER demands a decision!* · %s / %s (%s)\n*%s*\n", c.Workflow, c.Step, c.Kind, c.Title)
 	if body := strings.TrimSpace(c.Body); body != "" {

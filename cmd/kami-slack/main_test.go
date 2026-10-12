@@ -19,8 +19,7 @@ import (
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 
-	"kami/internal/engine"
-	"kami/internal/eventbus"
+	"power/internal/kami"
 )
 
 const owner = "UOWNER"
@@ -28,8 +27,8 @@ const owner = "UOWNER"
 // fakeKami serves /events, /contracts/{id} and /contracts/{id}/resolve.
 type fakeKami struct {
 	mu        sync.Mutex
-	events    []eventbus.Event
-	contracts map[string]*engine.Contract
+	events    []kami.Event
+	contracts map[string]*kami.Contract
 	resolves  []string // "id=answer data"
 
 	signals []map[string]any
@@ -43,11 +42,11 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 	env := func(w http.ResponseWriter, v any, code, msg string) {
 		if code != "" {
 			w.WriteHeader(422)
-			json.NewEncoder(w).Encode(engine.Envelope{Error: &engine.APIError{Code: code, Message: msg}})
+			json.NewEncoder(w).Encode(kami.Envelope{Error: &kami.APIError{Code: code, Message: msg}})
 			return
 		}
 		raw, _ := json.Marshal(v)
-		json.NewEncoder(w).Encode(engine.Envelope{OK: true, Data: raw})
+		json.NewEncoder(w).Encode(kami.Envelope{OK: true, Data: raw})
 	}
 	m := http.NewServeMux()
 	m.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
@@ -120,10 +119,10 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 	m.HandleFunc("GET /contracts", func(w http.ResponseWriter, r *http.Request) {
 		k.mu.Lock()
 		defer k.mu.Unlock()
-		out := []engine.ContractView{}
+		out := []kami.ContractView{}
 		for _, c := range k.contracts {
 			if c.RunID == r.URL.Query().Get("run") && c.Status == "open" {
-				out = append(out, engine.ContractView{Contract: c, Workflow: "chat"})
+				out = append(out, kami.ContractView{Contract: c, Workflow: "chat"})
 			}
 		}
 		env(w, out, "", "")
@@ -131,7 +130,7 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 	m.HandleFunc("GET /contracts/{id}", func(w http.ResponseWriter, r *http.Request) {
 		k.mu.Lock()
 		defer k.mu.Unlock()
-		env(w, engine.ContractView{Contract: k.contracts[r.PathValue("id")], Effective: "attended", Workflow: "hello"}, "", "")
+		env(w, kami.ContractView{Contract: k.contracts[r.PathValue("id")], Effective: "attended", Workflow: "hello"}, "", "")
 	})
 	m.HandleFunc("POST /contracts/{id}/resolve", func(w http.ResponseWriter, r *http.Request) {
 		k.mu.Lock()
@@ -154,8 +153,8 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 			env(w, nil, "INVALID", fmt.Sprintf("field \"rating\": want enum:good,bad, got %v", req.Data["rating"]))
 			return
 		}
-		c.Status, c.Resolution = "resolved", &engine.Resolution{Answer: req.Answer, By: "human"}
-		env(w, engine.ContractView{Contract: c}, "", "")
+		c.Status, c.Resolution = "resolved", &kami.Resolution{Answer: req.Answer, By: "human"}
+		env(w, kami.ContractView{Contract: c}, "", "")
 	})
 	return m
 }
@@ -251,7 +250,7 @@ func setup(t *testing.T) (*fakeKami, *fakeSlack, func() *adapter) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	k := &fakeKami{contracts: map[string]*engine.Contract{}, waiting: map[string]bool{}, busy: map[string]bool{}, runs: map[string]map[string]any{}}
+	k := &fakeKami{contracts: map[string]*kami.Contract{}, waiting: map[string]bool{}, busy: map[string]bool{}, runs: map[string]map[string]any{}}
 	sock := filepath.Join(dir, "k.sock")
 	l, err := net.Listen("unix", sock)
 	if err != nil {
@@ -290,13 +289,13 @@ func reply(user, thread, ts, text string) *slackevents.MessageEvent {
 func TestServe(t *testing.T) {
 	ctx := context.Background()
 	k, s, start := setup(t)
-	k.contracts["c1"] = &engine.Contract{ID: "c1", RunID: "r1", Step: "review", Kind: "choice", Title: "Keep the draft?",
+	k.contracts["c1"] = &kami.Contract{ID: "c1", RunID: "r1", Step: "review", Kind: "choice", Title: "Keep the draft?",
 		Body: "three lines about tea", Options: []string{"keep", "redo"}, Default: "keep", Status: "open", Lock: true}
-	k.contracts["c2"] = &engine.Contract{ID: "c2", RunID: "r1", Step: "rate", Kind: "form", Title: "Rate it",
+	k.contracts["c2"] = &kami.Contract{ID: "c2", RunID: "r1", Step: "rate", Kind: "form", Title: "Rate it",
 		Fields: map[string]string{"rating": "enum:good,bad"}, Options: []string{"rated"}, Status: "open"}
-	k.contracts["c3"] = &engine.Contract{ID: "c3", RunID: "r2", Kind: "ask", Title: "Which port?", Status: "open"}
+	k.contracts["c3"] = &kami.Contract{ID: "c3", RunID: "r2", Kind: "ask", Title: "Which port?", Status: "open"}
 	for i, id := range []string{"c1", "c2", "c3"} {
-		k.events = append(k.events, eventbus.Event{ID: int64(i + 1), Type: "contract.opened", Data: map[string]any{"id": id}})
+		k.events = append(k.events, kami.Event{ID: int64(i + 1), Type: "contract.opened", Data: map[string]any{"id": id}})
 	}
 	must := func(err error) {
 		t.Helper()
@@ -363,9 +362,9 @@ func TestServe(t *testing.T) {
 	// our own resolutions get no follow-up; one by the AFK resolver does
 	k.mu.Lock()
 	k.events = append(k.events,
-		eventbus.Event{ID: 4, Type: "contract.resolved", Data: map[string]any{"id": "c1", "answer": "keep", "by": "human"}},
-		eventbus.Event{ID: 5, Type: "contract.resolved", Data: map[string]any{"id": "c2", "answer": "rated", "by": "human"}},
-		eventbus.Event{ID: 6, Type: "contract.resolved", Data: map[string]any{"id": "c3", "answer": "8080", "by": "resolver"}})
+		kami.Event{ID: 4, Type: "contract.resolved", Data: map[string]any{"id": "c1", "answer": "keep", "by": "human"}},
+		kami.Event{ID: 5, Type: "contract.resolved", Data: map[string]any{"id": "c2", "answer": "rated", "by": "human"}},
+		kami.Event{ID: 6, Type: "contract.resolved", Data: map[string]any{"id": "c3", "answer": "8080", "by": "resolver"}})
 	k.mu.Unlock()
 	before := len(s.of("chat.postMessage"))
 	must(a.events(ctx))
@@ -410,13 +409,13 @@ func TestCanvasAndDM(t *testing.T) {
 }
 
 func TestParseReply(t *testing.T) {
-	form := &engine.ContractView{Contract: &engine.Contract{Options: []string{"rated"},
+	form := &kami.ContractView{Contract: &kami.Contract{Options: []string{"rated"},
 		Fields: map[string]string{"rating": "enum:good,bad", "replay": "bool", "note": "string?"}}}
 	ans, data := parseReply(form, `Rated rating=good replay=true note="two words"`)
 	if ans != "rated" || data["rating"] != "good" || data["replay"] != true || data["note"] != "two words" {
 		t.Fatalf("form = %q %v", ans, data)
 	}
-	ask := &engine.ContractView{Contract: &engine.Contract{Kind: "ask"}}
+	ask := &kami.ContractView{Contract: &kami.Contract{Kind: "ask"}}
 	if ans, _ := parseReply(ask, unslack("  see <https://x.io/a?b=1&amp;c=2|x.io> port=8080 ")); ans != "see https://x.io/a?b=1&c=2 port=8080" {
 		t.Fatalf("ask = %q", ans)
 	}
@@ -477,10 +476,10 @@ func TestChat(t *testing.T) {
 		t.Fatalf("busy: queue %v started %d", q, len(k.started))
 	}
 	// parked on its own question (wrap up?): the new message answers it with the last option
-	k.contracts["cw1"] = &engine.Contract{ID: "cw1", RunID: "run-300.1", Origin: "state", Step: "confirm_wrap", Kind: "choice", Title: "Wrap up?",
+	k.contracts["cw1"] = &kami.Contract{ID: "cw1", RunID: "run-300.1", Origin: "state", Step: "confirm_wrap", Kind: "choice", Title: "Wrap up?",
 		Options: []string{"unpin_and_wrap", "keep_going"}, Status: "open"}
 	// …but never a question the worker raised itself, whatever its options
-	k.contracts["cx1"] = &engine.Contract{ID: "cx1", RunID: "run-300.1", Origin: "worker", Kind: "choice", Title: "Push?",
+	k.contracts["cx1"] = &kami.Contract{ID: "cx1", RunID: "run-300.1", Origin: "worker", Kind: "choice", Title: "Push?",
 		Options: []string{"no", "yes, push"}, Status: "open"}
 	n := len(k.resolves)
 	a.routeAll(ctx)
@@ -523,9 +522,9 @@ func TestChat(t *testing.T) {
 func TestTranscript(t *testing.T) {
 	ctx := context.Background()
 	k, _, start := setup(t)
-	k.contracts["c1"] = &engine.Contract{ID: "c1", RunID: "r1", Kind: "choice", Title: "Keep?", Options: []string{"keep", "redo"}, Status: "open"}
-	k.contracts["c2"] = &engine.Contract{ID: "c2", RunID: "r2", Kind: "ask", Title: "Port?", Status: "open"}
-	k.events = []eventbus.Event{{ID: 1, Type: "contract.opened", Data: map[string]any{"id": "c1"}},
+	k.contracts["c1"] = &kami.Contract{ID: "c1", RunID: "r1", Kind: "choice", Title: "Keep?", Options: []string{"keep", "redo"}, Status: "open"}
+	k.contracts["c2"] = &kami.Contract{ID: "c2", RunID: "r2", Kind: "ask", Title: "Port?", Status: "open"}
+	k.events = []kami.Event{{ID: 1, Type: "contract.opened", Data: map[string]any{"id": "c1"}},
 		{ID: 2, Type: "contract.opened", Data: map[string]any{"id": "c2"}}}
 	a := start()
 	a.run = "rstep"
@@ -781,13 +780,13 @@ func TestRunThreads(t *testing.T) {
 	k.runs["rc"] = map[string]any{"id": "rc", "workflow": "lint", "parent": "rp", "vars": map[string]any{}}
 	k.runs["rn"] = map[string]any{"id": "rn", "workflow": "solo", "vars": map[string]any{}}
 	k.runs["rq"] = map[string]any{"id": "rq", "workflow": "release", "vars": map[string]any{"thread_ts": "800.1"}}
-	k.contracts["c1"] = &engine.Contract{ID: "c1", RunID: "rc", Origin: "state", Kind: "ask", Title: "Which port?", Status: "open"}
-	k.contracts["cN"] = &engine.Contract{ID: "cN", RunID: "rn", Origin: "state", Kind: "choice", Title: "Keep?", Options: []string{"keep", "redo"}, Status: "open"}
-	k.contracts["c5"] = &engine.Contract{ID: "c5", RunID: "rq", Origin: "engine", Kind: "blocker", Title: "Ship?", Options: []string{"ship", "hold"}, Status: "open"}
-	ev := func(id int64, typ, run string, data map[string]any) eventbus.Event {
-		return eventbus.Event{ID: id, TS: now, Type: typ, Run: run, Data: data}
+	k.contracts["c1"] = &kami.Contract{ID: "c1", RunID: "rc", Origin: "state", Kind: "ask", Title: "Which port?", Status: "open"}
+	k.contracts["cN"] = &kami.Contract{ID: "cN", RunID: "rn", Origin: "state", Kind: "choice", Title: "Keep?", Options: []string{"keep", "redo"}, Status: "open"}
+	k.contracts["c5"] = &kami.Contract{ID: "c5", RunID: "rq", Origin: "engine", Kind: "blocker", Title: "Ship?", Options: []string{"ship", "hold"}, Status: "open"}
+	ev := func(id int64, typ, run string, data map[string]any) kami.Event {
+		return kami.Event{ID: id, TS: now, Type: typ, Run: run, Data: data}
 	}
-	k.events = []eventbus.Event{
+	k.events = []kami.Event{
 		ev(1, "contract.opened", "rc", map[string]any{"id": "c1"}),
 		ev(2, "contract.opened", "rn", map[string]any{"id": "cN"}),
 		ev(3, "run.started", "rc", map[string]any{"workflow": "lint", "parent": "rp"}),
@@ -889,8 +888,8 @@ func TestRunThreads(t *testing.T) {
 	}
 
 	// two text-taking contracts in one thread: ambiguous → chat
-	k.contracts["c2"] = &engine.Contract{ID: "c2", RunID: "rc", Origin: "state", Kind: "ask", Title: "Name?", Status: "open"}
-	k.contracts["c3"] = &engine.Contract{ID: "c3", RunID: "rp", Origin: "state", Kind: "form", Title: "Rate", Fields: map[string]string{"rating": "enum:good,bad"}, Status: "open"}
+	k.contracts["c2"] = &kami.Contract{ID: "c2", RunID: "rc", Origin: "state", Kind: "ask", Title: "Name?", Status: "open"}
+	k.contracts["c3"] = &kami.Contract{ID: "c3", RunID: "rp", Origin: "state", Kind: "form", Title: "Rate", Fields: map[string]string{"rating": "enum:good,bad"}, Status: "open"}
 	k.mu.Lock()
 	k.events = append(k.events, ev(13, "contract.opened", "rc", map[string]any{"id": "c2"}), ev(14, "contract.opened", "rp", map[string]any{"id": "c3"}))
 	k.mu.Unlock()
@@ -914,7 +913,7 @@ func TestRunThreads(t *testing.T) {
 	a = start()
 	a.st.Cards["rp"].Children = nil
 	must(a.onCard(ctx, "rp", link{thread: "700.1", workflow: "build", root: "rp"},
-		eventbus.Event{Run: "rz", Type: "run.started"}, "late", "↳ POWER started late"))
+		kami.Event{Run: "rz", Type: "run.started"}, "late", "↳ POWER started late"))
 
 	// an AFK answer in rp's tree goes on rp's card, not into a message of its own
 	n := len(s.of("chat.postMessage"))
@@ -938,8 +937,8 @@ func TestBadRunThread(t *testing.T) {
 	ctx := context.Background()
 	k, s, start := setup(t)
 	k.runs["rb"] = map[string]any{"id": "rb", "workflow": "ping", "vars": map[string]any{"thread_ts": "999.9"}}
-	k.contracts["c1"] = &engine.Contract{ID: "c1", RunID: "rb", Origin: "state", Kind: "ask", Title: "Port?", Status: "open"}
-	k.events = []eventbus.Event{
+	k.contracts["c1"] = &kami.Contract{ID: "c1", RunID: "rb", Origin: "state", Kind: "ask", Title: "Port?", Status: "open"}
+	k.events = []kami.Event{
 		{ID: 1, TS: time.Now(), Type: "run.say", Run: "rb", Data: map[string]any{"text": "hi"}},
 		{ID: 2, TS: time.Now(), Type: "contract.opened", Run: "rb", Data: map[string]any{"id": "c1"}},
 	}
@@ -957,8 +956,8 @@ func TestWorkerAskInRunThread(t *testing.T) {
 	ctx := context.Background()
 	k, s, start := setup(t)
 	k.runs["rg"] = map[string]any{"id": "rg", "workflow": "goal", "vars": map[string]any{"thread_ts": "900.1"}}
-	k.contracts["cw"] = &engine.Contract{ID: "cw", RunID: "rg", Origin: "worker", Kind: "ask", Title: "Which repo?", Status: "open"}
-	k.events = []eventbus.Event{{ID: 1, TS: time.Now(), Type: "contract.opened", Run: "rg", Data: map[string]any{"id": "cw"}}}
+	k.contracts["cw"] = &kami.Contract{ID: "cw", RunID: "rg", Origin: "worker", Kind: "ask", Title: "Which repo?", Status: "open"}
+	k.events = []kami.Event{{ID: 1, TS: time.Now(), Type: "contract.opened", Run: "rg", Data: map[string]any{"id": "cw"}}}
 	a := start()
 	if err := a.events(ctx); err != nil {
 		t.Fatal(err)
