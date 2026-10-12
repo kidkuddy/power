@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/slack-go/slack"
@@ -270,6 +271,31 @@ func e2eOpen(msg string, me *ecdh.PrivateKey, from ...*ecdh.PublicKey) (string, 
 
 // --- adapter -----------------------------------------------------------------
 
+var threadTS = regexp.MustCompile(`^[0-9]{1,20}\.[0-9]{1,10}$`)
+
+// A sealed owner-DM thread is one empty file <data>/e2e-sealed/<root ts>: serve and
+// `power dm` (a script step) both add to it, so neither rewrites the other's state file.
+func (a *adapter) sealedPath(ts string) string { return filepath.Join(a.dir, "e2e-sealed", ts) }
+
+// isSealed fails closed: a mark it cannot check counts as sealed.
+func (a *adapter) isSealed(ts string) bool {
+	if !threadTS.MatchString(ts) {
+		return false
+	}
+	_, err := os.Stat(a.sealedPath(ts))
+	return err == nil || !errors.Is(err, os.ErrNotExist)
+}
+
+func (a *adapter) markSealed(ts string) error {
+	if !threadTS.MatchString(ts) {
+		return fmt.Errorf("e2e: bad thread ts %q", ts)
+	}
+	if err := os.MkdirAll(filepath.Dir(a.sealedPath(ts)), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(a.sealedPath(ts), nil, 0o600)
+}
+
 func sealedText(s string) bool { return strings.HasPrefix(strings.TrimSpace(s), e2ePrefix) }
 
 // unseal is the plaintext of a message sealed by the key of who ("owner" or
@@ -298,14 +324,28 @@ func (a *adapter) unseal(text, who string) (string, bool) {
 // the owner DM, the text and every section and context text are ciphertext;
 // buttons become "Option n" with a sealed value, explained by a sealed legend;
 // any other block or element (accessories, selects, headers) is dropped, never sent.
-func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blocks []slack.Block) (string, []slack.Block, error) {
-	if a.e2e == nil || thread == "" || !a.st.Sealed[thread] {
-		return text, blocks, nil
+// newRoot is a sealed top-level post: the thread under it must be marked sealed once posted.
+func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blocks []slack.Block) (_ string, _ []slack.Block, newRoot bool, _ error) {
+	if a.e2e == nil {
+		return text, blocks, false, nil
+	}
+	key := thread
+	if key == "" && a.run != "" {
+		// a script step posting a new root (launch's 🧵 thread for "thread me ..."): sealed when the
+		// conversation its run speaks for is, or the request would leave in plaintext in a new thread
+		l, err := a.runLink(a.run, 0)
+		if err != nil {
+			return "", nil, false, fmt.Errorf("e2e: thread of run %s: %w", a.run, err)
+		}
+		key = l.thread
+	}
+	if key == "" || !a.isSealed(key) {
+		return text, blocks, false, nil
 	}
 	if im, err := a.dm(ctx); err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	} else if channel != "" && channel != im {
-		return text, blocks, nil // the key is the owner DM's thread ts; another channel's thread is not sealed
+		return text, blocks, false, nil // the key is the owner DM's thread ts; another channel's thread is not sealed
 	}
 	seal := func(s string) (string, error) {
 		if strings.TrimSpace(s) == "" {
@@ -316,7 +356,7 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 	}
 	st, err := seal(text)
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	out := make([]slack.Block, 0, len(blocks))
 	for _, b := range blocks {
@@ -326,7 +366,7 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 			if c.Text != nil {
 				t := *c.Text
 				if t.Text, err = seal(t.Text); err != nil {
-					return "", nil, err
+					return "", nil, false, err
 				}
 				t.Type = slack.PlainTextType // the ciphertext is not mrkdwn
 				c.Text = &t
@@ -344,7 +384,7 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 				n := len(els) + 1
 				v, err := seal(btn.Value)
 				if err != nil {
-					return "", nil, err
+					return "", nil, false, err
 				}
 				nb := slack.NewButtonBlockElement(btn.ActionID, v, slack.NewTextBlockObject(slack.PlainTextType, fmt.Sprintf("Option %d", n), false, false))
 				nb.Style = btn.Style
@@ -360,7 +400,7 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 			}
 			l, err := seal(strings.Join(legend, "\n"))
 			if err != nil {
-				return "", nil, err
+				return "", nil, false, err
 			}
 			out = append(out, slack.NewActionBlock(b.BlockID, els...),
 				slack.NewContextBlock("", slack.NewTextBlockObject(slack.PlainTextType, l, false, false)))
@@ -372,7 +412,7 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 				if t, ok := el.(*slack.TextBlockObject); ok {
 					s, err := seal(t.Text)
 					if err != nil {
-						return "", nil, err
+						return "", nil, false, err
 					}
 					els = append(els, slack.NewTextBlockObject(slack.PlainTextType, s, false, false))
 				}
@@ -385,5 +425,5 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 	if blocks == nil {
 		out = nil
 	}
-	return st, out, nil
+	return st, out, thread == "", nil
 }
