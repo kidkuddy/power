@@ -538,7 +538,7 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		return err
 	}
 	if plain != m.Text { // the owner wrote sealed: this thread stays sealed both ways
-		if err := a.markSealed(sealKey); err != nil {
+		if err := a.markSealed(sealKey, isKanaText(m.Text)); err != nil {
 			return err
 		}
 	}

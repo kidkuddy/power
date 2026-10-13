@@ -333,14 +333,39 @@ func (a *adapter) isSealed(ts string) bool {
 	return err == nil || !errors.Is(err, os.ErrNotExist)
 }
 
-func (a *adapter) markSealed(ts string) error {
+func (a *adapter) markSealed(ts string, kana bool) error {
 	if !threadTS.MatchString(ts) {
 		return fmt.Errorf("e2e: bad thread ts %q", ts)
 	}
 	if err := os.MkdirAll(filepath.Dir(a.sealedPath(ts)), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(a.sealedPath(ts), nil, 0o600)
+	if _, err := os.Stat(a.sealedPath(ts)); err == nil {
+		return nil // a thread keeps the form it was sealed in
+	}
+	var form []byte
+	if kana {
+		form = []byte("kana")
+	}
+	return os.WriteFile(a.sealedPath(ts), form, 0o600)
+}
+
+// sealedKana says a sealed thread speaks kana. A mark from before kana is empty: that
+// thread stays "e2e3:" + base64, so a conversation never changes form halfway.
+func (a *adapter) sealedKana(ts string) bool {
+	b, err := os.ReadFile(a.sealedPath(ts))
+	return err == nil && string(b) == "kana"
+}
+
+// isKanaText is a sealed text in the kana form (not "e2e3:" + base64).
+func isKanaText(s string) bool {
+	return sealedText(s) && !strings.HasPrefix(strings.TrimSpace(s), e2ePrefix)
+}
+
+// asLegacy rewrites a kana ciphertext in the old "e2e3:" + base64 form: same bytes.
+func asLegacy(ct string) string {
+	b, _ := e2eDecode(ct)
+	return e2ePrefix + base64.StdEncoding.EncodeToString(b)
 }
 
 // sealedButton is the plaintext of a sealed button value.
@@ -411,12 +436,17 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 	} else if channel != "" && channel != im {
 		return text, blocks, false, nil // the key is the owner DM's thread ts; another channel's thread is not sealed
 	}
+	kana := a.sealedKana(key)
 	seal := func(s string) (string, error) {
 		if strings.TrimSpace(s) == "" {
 			return s, nil
 		}
 		// always sealed, even text that looks like e2e3 already: plaintext starting "e2e3:" must not pass
-		return e2eSeal(s, a.e2e.me, a.e2e.owner, a.e2e.me.PublicKey())
+		ct, err := e2eSeal(s, a.e2e.me, a.e2e.owner, a.e2e.me.PublicKey())
+		if err == nil && !kana {
+			ct = asLegacy(ct)
+		}
+		return ct, err
 	}
 	st, err := seal(text)
 	if err != nil {
@@ -492,4 +522,14 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 		out = nil
 	}
 	return st, out, thread == "", nil
+}
+
+// newRootKana is the form a sealed new root (sealOut's newRoot) is marked with: its run's thread's.
+func (a *adapter) newRootKana(thread string) bool {
+	if thread == "" && a.run != "" {
+		if l, err := a.runLink(a.run, 0); err == nil {
+			return a.sealedKana(l.thread)
+		}
+	}
+	return true
 }

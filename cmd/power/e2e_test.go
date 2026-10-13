@@ -140,6 +140,24 @@ func TestE2EThread(t *testing.T) {
 		t.Fatalf("owner reads %q %v", got, err)
 	}
 
+	if !isKanaText(last.Get("text")) {
+		t.Fatalf("a thread the owner sealed in kana is answered in kana: %q", last.Get("text"))
+	}
+
+	// a conversation sealed before kana (an "e2e3:" message, or a mark migrated from slack.json)
+	// keeps "e2e3:" both ways, and a later kana message does not switch it (that chat is started[1])
+	if err := a.onMessage(ctx, reply(owner, "", "350.1", asLegacy(in))); err != nil {
+		t.Fatal(err)
+	}
+	a.markSealed("350.1", true)
+	a.post(ctx, entry{ThreadTS: "350.1", Text: "old form reply"}, nil)
+	p = s.of("chat.postMessage")
+	if got := p[len(p)-1].Get("text"); !strings.HasPrefix(got, e2ePrefix) {
+		t.Fatalf("ongoing e2e3 thread answered in another form: %q", got)
+	} else if pt, err := e2eOpen(got, ownerKey, botPub); err != nil || pt != "old form reply" {
+		t.Fatalf("owner reads %q %v", pt, err)
+	}
+
 	// `power dm --channel D1` from the chat run seals too; another channel or thread does not
 	a.im = "" // a fresh CLI process has not opened the DM yet
 	a.post(ctx, entry{Channel: "D1", ThreadTS: "300.1", Text: "via cli"}, nil)
@@ -192,7 +210,7 @@ func TestE2EThread(t *testing.T) {
 		t.Fatal(err)
 	}
 	p = s.of("chat.postMessage")
-	if len(k.started) != 1 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") {
+	if len(k.started) != 2 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") {
 		t.Fatalf("replayed bot text accepted as owner: started %d last %v", len(k.started), p[len(p)-1])
 	}
 
@@ -262,7 +280,7 @@ func TestE2EThread(t *testing.T) {
 		t.Fatal(err)
 	}
 	p = s.of("chat.postMessage")
-	if len(k.started) != 1 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") || a.isSealed("500.1") {
+	if len(k.started) != 2 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") || a.isSealed("500.1") {
 		t.Fatalf("stranger: started %d last %v", len(k.started), p[len(p)-1])
 	}
 }
