@@ -22,6 +22,27 @@ const (
 	nodeMsg       = "e2e3:1rX7FO/ICjIQupbZOtNvYbEGxFwEPrxyJzBS4RsYBUvetxM2GOpgyr+aulXHYtSHYNd+Grdv7oiiAKlwaEaAVQIFBMUmp6YkCyx/Ego5ZU1T9P2NXo6mdLek0hPiJ9qghHUZaJrKKivIOthqvpLyjvfHsYcKMFPI7r63ukZzDkVJGrDuKLGKsXiY1VjuqLoKenpB6tPv8P9e/GTU+5gAjwioLtRpln91CsBlevc+Sm7HCtZFmxRU5Kz3BIFk9GPXjbdem1LHBFT6m//s3/PJB/dXncFdOX0Kg6T9ICRG3NEQrkOnjioUQepTcvYscm/ks+FqJwJCHjGrB91MomPvLWEdthtRv6TFzBC6hT1YDPrZ8RCjCdkoiZMqocxE3eDifHOwutirLqG20Ls="
 )
 
+// nodeKana is crypto.mjs's seal("kana from node: こんにちは 🔒", owner, [owner, bot]) in the kana form
+const nodeKana = "上音目さ土三かびけ学メ水ほ出ズガ右ぇ五ェぅみ九ソとぱん川ぜすうれひズペギルびされ町がど女ば五ぐイドひアソステピぼ森ヅンさ先ェへかぃ夕ドぼ日こづ音ゆゑ一ァァゆ文ホヵペな空むヴ年山早日にづぎあぎヰぐ下虫校セパねべゴこモ子ィ車ッ犬花ごユぇる休ペ雨ほじ金赤休貝ス林中に正たル一ナくドオプポエ王ごでめ正ヲョノホの火右ロ村さヨらプヸさのべ赤サおヲりゴゔソケ耳小ゴ貝ぃスシ王学ちふく力ゾヒぉきスツう八づもョだこヲデ正ぜマハひヮスョ木ケへしロワう十アヶ日ズ火ねタゐッ田て右ゕをぱリホ林つ四ブ車くエぼゃコ山ヶレ町ぉゖげ石ぷ耳花はぱうネロづひヺどやエ町ッじチざムサゃゖぶナツゕしけテエめぬイツぷぼれゲ村手ヤ川夕さ二円空カソっよ八見日出ヷし中ダケ千"
+
+func TestE2EKana(t *testing.T) {
+	owner, bot := mustPriv(t, nodeOwnerPriv), mustPriv(t, nodeBotPriv)
+	if got, err := e2eOpen(nodeKana, bot, owner.PublicKey()); err != nil || got != "kana from node: こんにちは 🔒" {
+		t.Fatalf("node kana message: %q %v", got, err)
+	}
+	// same vector as crypto.mjs's self-check
+	if got := toKana([]byte{0, 1, 85, 86, 175, 176, 255}); got != "ぁあゖァヺ一六" || len(e2eKana) != 256 || len(e2eKanaIdx) != 256 {
+		t.Fatalf("alphabet differs from crypto.mjs: %q", got)
+	}
+	ct, _ := e2eSeal("x", bot, owner.PublicKey())
+	if strings.ContainsFunc(ct, func(r rune) bool { _, ok := e2eKanaIdx[r]; return !ok }) || !sealedText(ct) {
+		t.Fatalf("seal is not kana only: %q", ct)
+	}
+	if sealedText("こんにちは、元気ですか") || sealedText("e2e3: not really sealed") {
+		t.Fatal("ordinary text taken for ciphertext")
+	}
+}
+
 func mustPriv(t *testing.T, s string) *ecdh.PrivateKey {
 	t.Helper()
 	p, err := decodePriv(s)
@@ -52,14 +73,14 @@ func TestE2EFormat(t *testing.T) {
 	}
 	// a stranger who knows the bot's public key puts the owner's key in the header
 	forged, _ := e2eSeal("i am the owner", other, bot.PublicKey())
-	raw, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(forged, e2ePrefix))
+	raw, _ := e2eDecode(forged)
 	copy(raw, owner.PublicKey().Bytes())
-	if _, err := e2eOpen(e2ePrefix+base64.StdEncoding.EncodeToString(raw), bot, owner.PublicKey()); err == nil {
+	if _, err := e2eOpen(toKana(raw), bot, owner.PublicKey()); err == nil {
 		t.Fatal("forged sender accepted")
 	}
 	// the bot is a co-recipient of the owner's [owner, bot] message, so it knows K: a new body under the
 	// owner's slots must not open for the owner as the owner's own words
-	raw, _ = base64.StdEncoding.DecodeString(strings.TrimPrefix(nodeMsg, e2ePrefix))
+	raw, _ = e2eDecode(nodeMsg)
 	pre, n := raw[:65], int(raw[64])
 	d1, _ := bot.ECDH(mustPub(t, raw[32:64]))
 	d2, _ := bot.ECDH(owner.PublicKey())
@@ -71,7 +92,7 @@ func TestE2EFormat(t *testing.T) {
 		}
 	}
 	body, _ := gcmSeal(key, []byte("forged by the bot"), pre)
-	swapped := e2ePrefix + base64.StdEncoding.EncodeToString(concat(raw[:65+n*e2eSlot], body))
+	swapped := toKana(concat(raw[:65+n*e2eSlot], body))
 	if got, err := e2eOpen(swapped, owner, owner.PublicKey()); err == nil {
 		t.Fatalf("co-recipient swapped the body: %q", got)
 	}
@@ -156,7 +177,7 @@ func TestE2EThread(t *testing.T) {
 	s.replies["300.1"] = []map[string]any{{"ts": "300.1", "user": owner, "text": in}, {"ts": "300.2", "bot_id": "B1", "text": last.Get("text")}}
 	s.mu.Unlock()
 	h, err := a.history(ctx, "300.1", nil)
-	if err != nil || !strings.Contains(h, "deploy the <secret> thing") || !strings.Contains(h, "on it, secret plan") || strings.Contains(h, e2ePrefix) {
+	if err != nil || !strings.Contains(h, "deploy the <secret> thing") || !strings.Contains(h, "on it, secret plan") || strings.ContainsFunc(h, func(r rune) bool { _, ok := e2eKanaIdx[r]; return ok }) {
 		t.Fatalf("history %q %v", h, err)
 	}
 	s.mu.Lock()

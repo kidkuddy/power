@@ -125,9 +125,60 @@ func decodePub(s string) (*ecdh.PublicKey, error) {
 
 // --- format (e2e3, see crypto.mjs) -------------------------------------------
 //
-// "e2e3:" + base64( pre | n × slot | body ), pre = spub | eph | n,
+// kana( pre | n × slot | body ), pre = spub | eph | n,
 // body = AES-GCM_K(text, AAD pre), slot = AES-GCM_W(K || SHA-256(body), AAD pre).
 // A slot pins its body, so a co-recipient who knows K cannot swap the body.
+// kana writes one byte as one character of e2eKana, with no prefix, so the text reads
+// as Japanese; the old "e2e3:" + base64 text still opens.
+
+// e2eKana is crypto.mjs's KANA: hiragana U+3041..3096, katakana U+30A1..30FA, the 80
+// first-grade kanji. Each survives Unicode NFC/NFKC, so Slack cannot rewrite it.
+var e2eKana = func() []rune {
+	var k []rune
+	for r := rune(0x3041); r <= 0x3096; r++ {
+		k = append(k, r)
+	}
+	for r := rune(0x30a1); r <= 0x30fa; r++ {
+		k = append(k, r)
+	}
+	return append(k, []rune("一右雨円王音下火花貝学気九休玉金空月犬見五口校左三山子四糸字耳七車手十出女小上森人水正生青夕石赤千川先早草足村大男竹中虫町天田土二日入年白八百文木本名目立力林六")...)
+}()
+
+var e2eKanaIdx = func() map[rune]byte {
+	m := make(map[rune]byte, len(e2eKana))
+	for i, r := range e2eKana {
+		m[r] = byte(i)
+	}
+	return m
+}()
+
+const e2eMin = 65 + e2eSlot + 28 // pre + one slot + empty body
+
+func toKana(b []byte) string {
+	r := make([]rune, len(b))
+	for i, c := range b {
+		r[i] = e2eKana[c]
+	}
+	return string(r)
+}
+
+// e2eDecode is the bytes of a sealed text, either form; ok is false for any other text.
+func e2eDecode(msg string) (_ []byte, ok bool) {
+	s := strings.Join(strings.Fields(msg), "")
+	if enc, ok := strings.CutPrefix(s, e2ePrefix); ok {
+		b, err := base64.StdEncoding.DecodeString(enc)
+		return b, err == nil
+	}
+	b := make([]byte, 0, len(s)/3)
+	for _, r := range s {
+		c, ok := e2eKanaIdx[r]
+		if !ok {
+			return nil, false
+		}
+		b = append(b, c)
+	}
+	return b, len(b) >= e2eMin
+}
 
 func wrapKey(ikm, spub, eph, rpub []byte) ([]byte, error) {
 	return hkdf.Key(sha256.New, ikm, concat(spub, eph, rpub), "e2e3 wrap", 32)
@@ -202,20 +253,16 @@ func e2eSeal(text string, sender *ecdh.PrivateKey, recipients ...*ecdh.PublicKey
 		}
 		out = concat(out, slot)
 	}
-	return e2ePrefix + base64.StdEncoding.EncodeToString(concat(out, body)), nil
+	return toKana(concat(out, body)), nil
 }
 
 var errNotForUs = errors.New("e2e3: not addressed to us or not from the expected key")
 
 // e2eOpen decrypts msg when it is addressed to me and was sealed by one of from.
 func e2eOpen(msg string, me *ecdh.PrivateKey, from ...*ecdh.PublicKey) (string, error) {
-	enc, ok := strings.CutPrefix(strings.TrimSpace(msg), e2ePrefix)
+	buf, ok := e2eDecode(msg)
 	if !ok {
-		return "", errors.New("e2e3: no prefix")
-	}
-	buf, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(enc), ""))
-	if err != nil {
-		return "", fmt.Errorf("e2e3: %v", err)
+		return "", errors.New("e2e3: not sealed text")
 	}
 	if len(buf) < 65 {
 		return "", errors.New("e2e3: short")
@@ -313,7 +360,7 @@ func buttonValue(plain string) string {
 	return plain
 }
 
-func sealedText(s string) bool { return strings.HasPrefix(strings.TrimSpace(s), e2ePrefix) }
+func sealedText(s string) bool { _, ok := e2eDecode(s); return ok }
 
 // unseal is the plaintext of a message sealed by the key of who ("owner" or
 // "bot", POWER herself); any other text is returned as it is. ok is false for
