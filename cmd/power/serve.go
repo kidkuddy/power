@@ -987,8 +987,10 @@ func render(c *kami.ContractView) string {
 	return b.String()
 }
 
+// section is card text, always shown in full: without expand Slack cuts long text to "Show more"
 func section(text string) slack.Block {
-	return slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil)
+	return slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil,
+		slack.SectionBlockOptionExpand(true))
 }
 
 // contractBlocks is the text plus, for a choice-like contract, one button per

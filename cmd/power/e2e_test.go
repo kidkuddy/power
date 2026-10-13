@@ -280,3 +280,10 @@ func TestE2EMigrate(t *testing.T) {
 		t.Fatalf("load rewrote slack.json: %s (was %s)", after, before)
 	}
 }
+
+func TestSectionAlwaysExpanded(t *testing.T) {
+	b, _ := json.Marshal(section("long card text"))
+	if !strings.Contains(string(b), `"expand":true`) {
+		t.Fatalf("section would be cut by Slack: %s", b)
+	}
+}
