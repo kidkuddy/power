@@ -362,17 +362,16 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 	for _, b := range blocks {
 		switch b := b.(type) {
 		case *slack.SectionBlock:
-			c := *b
-			if c.Text != nil {
-				t := *c.Text
-				if t.Text, err = seal(t.Text); err != nil {
-					return "", nil, false, err
-				}
-				t.Type = slack.PlainTextType // the ciphertext is not mrkdwn
-				c.Text = &t
+			// sent as rich_text, not a section: Slack's client cuts long section text to "…" + Show more,
+			// and a cut ciphertext cannot be opened. Fields and accessory are dropped rather than leaked.
+			if b.Text == nil {
+				continue
 			}
-			c.Fields, c.Accessory = nil, nil // never used here; dropped rather than leaked
-			out = append(out, &c)
+			s, err := seal(b.Text.Text)
+			if err != nil {
+				return "", nil, false, err
+			}
+			out = append(out, slack.NewRichTextBlock(b.BlockID, slack.NewRichTextSection(slack.NewRichTextSectionTextElement(s, nil))))
 		case *slack.ActionBlock:
 			var els []slack.BlockElement
 			var legend []string

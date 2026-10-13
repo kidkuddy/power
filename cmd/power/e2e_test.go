@@ -217,6 +217,10 @@ func TestE2EThread(t *testing.T) {
 	if !strings.Contains(raw, "Option 1") || !sealedText(keepVal) {
 		t.Fatalf("buttons: %s", raw)
 	}
+	// Slack truncates long section text in its client, which breaks the ciphertext
+	if strings.Contains(raw, `"type":"section"`) || !strings.Contains(raw, `"type":"rich_text"`) {
+		t.Fatalf("sealed text must go out as rich_text: %s", raw)
+	}
 	tap := tap(owner, "c9", keepVal)
 	tap.Channel.ID, tap.Message.Timestamp = "D1", "300.5"
 	if err := a.onAction(ctx, tap); err != nil {
