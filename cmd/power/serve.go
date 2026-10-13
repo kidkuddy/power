@@ -517,7 +517,10 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		return nil
 	}
 	inThread := m.ThreadTimeStamp != "" && m.ThreadTimeStamp != m.TimeStamp
-	plain, readable := a.unseal(m.Text, "owner")
+	plain, form, sealedAt, readable := a.unsealForm(m.Text, "owner")
+	if ts, err := strconv.ParseFloat(m.TimeStamp, 64); readable && !sealedAt.IsZero() && err == nil && ts-float64(sealedAt.Unix()) > 600 {
+		readable = false // sealed well before Slack says it was sent: an old message of the owner's posted again
+	}
 	in := entry{Dir: "in", Kind: "dm", Channel: m.Channel, TS: m.TimeStamp, ThreadTS: m.ThreadTimeStamp, User: m.User, Text: plain}
 	if inThread {
 		in.Kind = "thread_reply"
@@ -531,14 +534,14 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 	if inThread {
 		sealKey = m.ThreadTimeStamp
 	}
-	if !readable { // e2e3 POWER cannot open: wrong key, not from the owner's key, or tampered
+	if !readable { // e2e3 POWER cannot open: wrong key, not from the owner's key, tampered, or replayed
 		in.Error = "e2e3: unreadable"
 		a.record(in)
 		_, _, err := a.post(ctx, entry{Kind: "error", ThreadTS: sealKey, Text: "🔒 POWER could not decrypt that message (wrong key, or not from your key).", Error: in.Error}, nil)
 		return err
 	}
 	if plain != m.Text { // the owner wrote sealed: this thread stays sealed both ways
-		if err := a.markSealed(sealKey, isKanaText(m.Text)); err != nil {
+		if err := a.markSealed(sealKey, form); err != nil {
 			return err
 		}
 	}

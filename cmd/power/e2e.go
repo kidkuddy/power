@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/slack-go/slack"
 )
@@ -152,7 +154,7 @@ var e2eKanaIdx = func() map[rune]byte {
 	return m
 }()
 
-const e2eMin = 65 + e2eSlot + 28 // pre + one slot + empty body
+const e2eMin = 1 + 16 + 4 + 16 // the shortest sealed text: a pair message from POWER with no text
 
 func toKana(b []byte) string {
 	r := make([]rune, len(b))
@@ -256,6 +258,77 @@ func e2eSeal(text string, sender *ecdh.PrivateKey, recipients ...*ecdh.PublicKey
 	return toKana(concat(out, body)), nil
 }
 
+// --- pair format (e2e4, see crypto.mjs) --------------------------------------
+//
+// b0 | nonce(16) | AES-256-GCM_K(time(4) | text, iv 0, AAD b0|nonce) | tag [| self(16)], b0 0xE1 from the
+// owner (who appends a self tag only the owner can check), 0xE2 from POWER. K = HKDF(X25519(owner, POWER),
+// salt nonce, info "e2e4 pair"|b0|ownerPub|powerPub). POWER is always the peer side here.
+
+const (
+	pairOwner = 0xe1
+	pairPeer  = 0xe2
+)
+
+func pairKey(me *ecdh.PrivateKey, other *ecdh.PublicKey, b0 byte, nonce, ownerRaw, peerRaw []byte) ([]byte, error) {
+	sh, err := me.ECDH(other)
+	if err != nil {
+		return nil, err
+	}
+	return hkdf.Key(sha256.New, sh, nonce, string(concat([]byte("e2e4 pair"), []byte{b0}, ownerRaw, peerRaw)), 32)
+}
+
+func pairGCM(key []byte) (cipher.AEAD, error) {
+	b, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(b)
+}
+
+// e2ePairSeal is POWER's text to the owner, in kana.
+func e2ePairSeal(text string, me *ecdh.PrivateKey, owner *ecdh.PublicKey, now time.Time) (string, error) {
+	nonce := make([]byte, 16)
+	rand.Read(nonce)
+	head := concat([]byte{pairPeer}, nonce)
+	k, err := pairKey(me, owner, pairPeer, nonce, owner.Bytes(), me.PublicKey().Bytes())
+	if err != nil {
+		return "", err
+	}
+	g, err := pairGCM(k)
+	if err != nil {
+		return "", err
+	}
+	t := make([]byte, 4)
+	binary.BigEndian.PutUint32(t, uint32(now.Unix()))
+	return toKana(g.Seal(head, make([]byte, 12), concat(t, []byte(text)), head)), nil
+}
+
+// e2ePairOpen opens a pair message to or from the owner. The owner's self tag is
+// not POWER's to check: it only lets the owner's Mac tell its own messages apart.
+func e2ePairOpen(b []byte, me *ecdh.PrivateKey, owner *ecdh.PublicKey) (text string, fromOwner bool, at time.Time, err error) {
+	fromOwner = b[0] == pairOwner
+	end := len(b)
+	if fromOwner {
+		end -= 16
+	}
+	if end < e2eMin {
+		return "", false, at, errors.New("e2e4: short")
+	}
+	k, err := pairKey(me, owner, b[0], b[1:17], owner.Bytes(), me.PublicKey().Bytes())
+	if err != nil {
+		return "", false, at, err
+	}
+	g, err := pairGCM(k)
+	if err != nil {
+		return "", false, at, err
+	}
+	pt, err := g.Open(nil, make([]byte, 12), b[17:end], b[:17])
+	if err != nil {
+		return "", false, at, errNotForUs
+	}
+	return string(pt[4:]), fromOwner, time.Unix(int64(binary.BigEndian.Uint32(pt)), 0), nil
+}
+
 var errNotForUs = errors.New("e2e3: not addressed to us or not from the expected key")
 
 // e2eOpen decrypts msg when it is addressed to me and was sealed by one of from.
@@ -333,7 +406,7 @@ func (a *adapter) isSealed(ts string) bool {
 	return err == nil || !errors.Is(err, os.ErrNotExist)
 }
 
-func (a *adapter) markSealed(ts string, kana bool) error {
+func (a *adapter) markSealed(ts, form string) error {
 	if !threadTS.MatchString(ts) {
 		return fmt.Errorf("e2e: bad thread ts %q", ts)
 	}
@@ -343,23 +416,14 @@ func (a *adapter) markSealed(ts string, kana bool) error {
 	if _, err := os.Stat(a.sealedPath(ts)); err == nil {
 		return nil // a thread keeps the form it was sealed in
 	}
-	var form []byte
-	if kana {
-		form = []byte("kana")
-	}
-	return os.WriteFile(a.sealedPath(ts), form, 0o600)
+	return os.WriteFile(a.sealedPath(ts), []byte(form), 0o600)
 }
 
-// sealedKana says a sealed thread speaks kana. A mark from before kana is empty: that
-// thread stays "e2e3:" + base64, so a conversation never changes form halfway.
-func (a *adapter) sealedKana(ts string) bool {
-	b, err := os.ReadFile(a.sealedPath(ts))
-	return err == nil && string(b) == "kana"
-}
-
-// isKanaText is a sealed text in the kana form (not "e2e3:" + base64).
-func isKanaText(s string) bool {
-	return sealedText(s) && !strings.HasPrefix(strings.TrimSpace(s), e2ePrefix)
+// sealedForm is the form a sealed thread speaks: "pair", "kana" (e2e3 bytes as kana) or
+// "" for the "e2e3:" + base64 of marks from before kana, so a conversation never changes form halfway.
+func (a *adapter) sealedForm(ts string) string {
+	b, _ := os.ReadFile(a.sealedPath(ts))
+	return string(b)
 }
 
 // asLegacy rewrites a kana ciphertext in the old "e2e3:" + base64 form: same bytes.
@@ -392,21 +456,37 @@ func sealedText(s string) bool { _, ok := e2eDecode(s); return ok }
 // e2e3 text POWER cannot read or that another key sealed: POWER's own sealed
 // reply posted under the owner's name is not the owner speaking.
 func (a *adapter) unseal(text, who string) (string, bool) {
-	if !sealedText(text) {
-		return text, true
+	plain, _, _, ok := a.unsealForm(text, who)
+	return plain, ok
+}
+
+// unsealForm is unseal plus the form text was sealed in and, for a pair message, when it was sealed.
+func (a *adapter) unsealForm(text, who string) (plain, form string, sealedAt time.Time, ok bool) {
+	b, sealed := e2eDecode(text)
+	if !sealed {
+		return text, "", time.Time{}, true
 	}
 	if a.e2e == nil {
-		return text, false
+		return text, "", time.Time{}, false
+	}
+	form = "kana"
+	if strings.HasPrefix(strings.TrimSpace(text), e2ePrefix) {
+		form = ""
+	} else if b[0] == pairOwner || b[0] == pairPeer {
+		if pt, fromOwner, at, err := e2ePairOpen(b, a.e2e.me, a.e2e.owner); err == nil {
+			return pt, "pair", at, fromOwner == (who == "owner")
+		}
+		// else an e2e3 header whose first byte looks like a pair one: tried below
 	}
 	from := a.e2e.me.PublicKey()
 	if who == "owner" {
 		from = a.e2e.owner
 	}
-	plain, err := e2eOpen(text, a.e2e.me, from)
+	pt, err := e2eOpen(text, a.e2e.me, from)
 	if err != nil {
-		return text, false
+		return text, form, time.Time{}, false
 	}
-	return plain, true
+	return pt, form, time.Time{}, true
 }
 
 // sealOut is what goes to Slack for a post or a redraw: in a sealed thread of
@@ -436,14 +516,17 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 	} else if channel != "" && channel != im {
 		return text, blocks, false, nil // the key is the owner DM's thread ts; another channel's thread is not sealed
 	}
-	kana := a.sealedKana(key)
+	form := a.sealedForm(key)
 	seal := func(s string) (string, error) {
 		if strings.TrimSpace(s) == "" {
 			return s, nil
 		}
 		// always sealed, even text that looks like e2e3 already: plaintext starting "e2e3:" must not pass
+		if form == "pair" {
+			return e2ePairSeal(s, a.e2e.me, a.e2e.owner, time.Now())
+		}
 		ct, err := e2eSeal(s, a.e2e.me, a.e2e.owner, a.e2e.me.PublicKey())
-		if err == nil && !kana {
+		if err == nil && form == "" {
 			ct = asLegacy(ct)
 		}
 		return ct, err
@@ -524,12 +607,12 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 	return st, out, thread == "", nil
 }
 
-// newRootKana is the form a sealed new root (sealOut's newRoot) is marked with: its run's thread's.
-func (a *adapter) newRootKana(thread string) bool {
+// newRootForm is the form a sealed new root (sealOut's newRoot) is marked with: its run's thread's.
+func (a *adapter) newRootForm(thread string) string {
 	if thread == "" && a.run != "" {
 		if l, err := a.runLink(a.run, 0); err == nil {
-			return a.sealedKana(l.thread)
+			return a.sealedForm(l.thread)
 		}
 	}
-	return true
+	return "pair"
 }

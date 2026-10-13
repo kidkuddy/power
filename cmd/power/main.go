@@ -325,7 +325,7 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 		if e.Channel, e.TS, err = a.api.PostMessageContext(ctx, im, opts...); err != nil {
 			err = fmt.Errorf("post message: %w", err)
 		} else if newRoot {
-			if err = a.markSealed(e.TS, a.newRootKana(e.ThreadTS)); err != nil { // posted sealed, but its thread would not stay sealed
+			if err = a.markSealed(e.TS, a.newRootForm(e.ThreadTS)); err != nil { // posted sealed, but its thread would not stay sealed
 				err = fmt.Errorf("posted %s sealed but could not mark its thread: %w", e.TS, err)
 			}
 		}
@@ -630,7 +630,7 @@ func (a *adapter) load() error {
 		a.st.Convs = map[string][]convMsg{}
 	}
 	for ts := range a.st.Sealed { // older builds kept sealed threads in this file
-		if err := a.markSealed(ts, false); err != nil {
+		if err := a.markSealed(ts, ""); err != nil {
 			return err
 		}
 	}

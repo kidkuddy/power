@@ -5,10 +5,12 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/slack-go/slack"
 
@@ -24,6 +26,25 @@ const (
 
 // nodeKana is crypto.mjs's seal("kana from node: こんにちは 🔒", owner, [owner, bot]) in the kana form
 const nodeKana = "上音目さ土三かびけ学メ水ほ出ズガ右ぇ五ェぅみ九ソとぱん川ぜすうれひズペギルびされ町がど女ば五ぐイドひアソステピぼ森ヅンさ先ェへかぃ夕ドぼ日こづ音ゆゑ一ァァゆ文ホヵペな空むヴ年山早日にづぎあぎヰぐ下虫校セパねべゴこモ子ィ車ッ犬花ごユぇる休ペ雨ほじ金赤休貝ス林中に正たル一ナくドオプポエ王ごでめ正ヲョノホの火右ロ村さヨらプヸさのべ赤サおヲりゴゔソケ耳小ゴ貝ぃスシ王学ちふく力ゾヒぉきスツう八づもョだこヲデ正ぜマハひヮスョ木ケへしロワう十アヶ日ズ火ねタゐッ田て右ゕをぱリホ林つ四ブ車くエぼゃコ山ヶレ町ぉゖげ石ぷ耳花はぱうネロづひヺどやエ町ッじチざムサゃゖぶナツゕしけテエめぬイツぷぼれゲ村手ヤ川夕さ二円空カソっよ八見日出ヷし中ダケ千"
+
+// nodePair is crypto.mjs's sealPair("pair from node: やあ 🔒", owner, bot, true) at 1791892000
+const nodePair = "川下口山もュ本みグを上フうがゅリはマォヺぴクッケねと六ヂヰぐグオツゕゲアはヱコいツばド糸十ヴ山シヹゐねぷをヒヱよゑニ草青男ズパ校オぱ学ぜヨ百百月金先ピ千ィ金テゾ"
+
+func TestE2EPair(t *testing.T) {
+	owner, bot := mustPriv(t, nodeOwnerPriv), mustPriv(t, nodeBotPriv)
+	b, _ := e2eDecode(nodePair)
+	if pt, fromOwner, at, err := e2ePairOpen(b, bot, owner.PublicKey()); err != nil || !fromOwner || pt != "pair from node: やあ 🔒" || at.Unix() != 1791892000 {
+		t.Fatalf("node pair: %q %v %v %v", pt, fromOwner, at, err)
+	}
+	b[0] = pairPeer // Slack flips the direction: it does not open
+	if _, _, _, err := e2ePairOpen(b, bot, owner.PublicKey()); err == nil {
+		t.Fatal("direction flip accepted")
+	}
+	if os.Getenv("E2E_PRINT") != "" { // E2E_PRINT=1 go test -run TestE2EPair -v: a vector for crypto.mjs to open
+		ct, _ := e2ePairSeal("pair from go: やあ", bot, owner.PublicKey(), time.Unix(1791892000, 0))
+		t.Log(ct)
+	}
+}
 
 func TestE2EKana(t *testing.T) {
 	owner, bot := mustPriv(t, nodeOwnerPriv), mustPriv(t, nodeBotPriv)
@@ -41,6 +62,24 @@ func TestE2EKana(t *testing.T) {
 	if sealedText("こんにちは、元気ですか") || sealedText("e2e3: not really sealed") {
 		t.Fatal("ordinary text taken for ciphertext")
 	}
+}
+
+// ownerPair is what the owner's Mac (crypto.mjs sealPair) sends; the self tag is random here, POWER never checks it.
+func ownerPair(t *testing.T, text string, owner *ecdh.PrivateKey, bot *ecdh.PublicKey, at time.Time) string {
+	t.Helper()
+	nonce := make([]byte, 16)
+	rand.Read(nonce)
+	head := concat([]byte{pairOwner}, nonce)
+	k, err := pairKey(owner, bot, pairOwner, nonce, owner.PublicKey().Bytes(), bot.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, _ := pairGCM(k)
+	ts := make([]byte, 4)
+	binary.BigEndian.PutUint32(ts, uint32(at.Unix()))
+	self := make([]byte, 16)
+	rand.Read(self)
+	return toKana(concat(g.Seal(head, make([]byte, 12), concat(ts, []byte(text)), head), self))
 }
 
 func mustPriv(t *testing.T, s string) *ecdh.PrivateKey {
@@ -140,16 +179,45 @@ func TestE2EThread(t *testing.T) {
 		t.Fatalf("owner reads %q %v", got, err)
 	}
 
-	if !isKanaText(last.Get("text")) {
-		t.Fatalf("a thread the owner sealed in kana is answered in kana: %q", last.Get("text"))
+	if got := last.Get("text"); strings.HasPrefix(got, e2ePrefix) || a.sealedForm("300.1") != "kana" {
+		t.Fatalf("a thread the owner sealed in kana is answered in kana: %q", got)
+	}
+
+	// a new conversation in the pair form: answered in pair form; a pair message replayed later is refused
+	if err := a.onMessage(ctx, reply(owner, "", "600.1", ownerPair(t, "pair hello", ownerKey, botPub, time.Unix(600, 0)))); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(k.started); n != 2 || k.started[1]["inputs"].(map[string]any)["text"] != "pair hello" || a.sealedForm("600.1") != "pair" {
+		t.Fatalf("pair dm: started %v form %q", k.started, a.sealedForm("600.1"))
+	}
+	a.post(ctx, entry{ThreadTS: "600.1", Text: "pair reply"}, nil)
+	p = s.of("chat.postMessage")
+	pb, _ := e2eDecode(p[len(p)-1].Get("text"))
+	if pt, fromOwner, _, err := e2ePairOpen(pb, a.e2e.me, ownerKey.PublicKey()); err != nil || fromOwner || pt != "pair reply" || len(pb) != 1+16+4+len("pair reply")+16 {
+		t.Fatalf("pair reply: %q %v %v len %d", pt, fromOwner, err, len(pb))
+	}
+	if err := a.onMessage(ctx, reply(owner, "600.1", "4000.1", ownerPair(t, "deploy again", ownerKey, botPub, time.Unix(600, 0)))); err != nil {
+		t.Fatal(err)
+	}
+	p = s.of("chat.postMessage")
+	nb, _ := e2eDecode(p[len(p)-1].Get("text")) // the notice is sealed too: the thread is
+	if notice, _, _, _ := e2ePairOpen(nb, a.e2e.me, ownerKey.PublicKey()); len(k.started) != 2 || !strings.Contains(notice, "could not decrypt") {
+		t.Fatalf("replayed pair message accepted: started %d last %v", len(k.started), p[len(p)-1])
+	}
+	// POWER's own pair reply posted under the owner's name is not the owner speaking
+	if err := a.onMessage(ctx, reply(owner, "600.1", "601.1", p[len(p)-2].Get("text"))); err != nil {
+		t.Fatal(err)
+	}
+	if len(k.started) != 2 {
+		t.Fatalf("bot pair text accepted as owner: started %d", len(k.started))
 	}
 
 	// a conversation sealed before kana (an "e2e3:" message, or a mark migrated from slack.json)
-	// keeps "e2e3:" both ways, and a later kana message does not switch it (that chat is started[1])
+	// keeps "e2e3:" both ways, and a later kana message does not switch it (that chat is started[2])
 	if err := a.onMessage(ctx, reply(owner, "", "350.1", asLegacy(in))); err != nil {
 		t.Fatal(err)
 	}
-	a.markSealed("350.1", true)
+	a.markSealed("350.1", "kana")
 	a.post(ctx, entry{ThreadTS: "350.1", Text: "old form reply"}, nil)
 	p = s.of("chat.postMessage")
 	if got := p[len(p)-1].Get("text"); !strings.HasPrefix(got, e2ePrefix) {
@@ -210,7 +278,7 @@ func TestE2EThread(t *testing.T) {
 		t.Fatal(err)
 	}
 	p = s.of("chat.postMessage")
-	if len(k.started) != 2 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") {
+	if len(k.started) != 3 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") {
 		t.Fatalf("replayed bot text accepted as owner: started %d last %v", len(k.started), p[len(p)-1])
 	}
 
@@ -280,7 +348,7 @@ func TestE2EThread(t *testing.T) {
 		t.Fatal(err)
 	}
 	p = s.of("chat.postMessage")
-	if len(k.started) != 2 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") || a.isSealed("500.1") {
+	if len(k.started) != 3 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") || a.isSealed("500.1") {
 		t.Fatalf("stranger: started %d last %v", len(k.started), p[len(p)-1])
 	}
 }
