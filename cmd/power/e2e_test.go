@@ -157,7 +157,8 @@ func TestE2EThread(t *testing.T) {
 	botPub := a.e2e.me.PublicKey()
 	in, _ := e2eSeal("deploy the <secret> thing", ownerKey, ownerKey.PublicKey(), botPub)
 
-	// a sealed DM: the chat gets the plaintext, the thread is sealed
+	// a thread sealed in kana e2e3 (marked so by the build before the pair form): the chat gets the plaintext
+	a.markSealed("300.1", "kana")
 	if err := a.onMessage(ctx, reply(owner, "", "300.1", in)); err != nil {
 		t.Fatal(err)
 	}
@@ -204,6 +205,15 @@ func TestE2EThread(t *testing.T) {
 	if notice, _, _, _ := e2ePairOpen(nb, a.e2e.me, ownerKey.PublicKey()); len(k.started) != 2 || !strings.Contains(notice, "could not decrypt") {
 		t.Fatalf("replayed pair message accepted: started %d last %v", len(k.started), p[len(p)-1])
 	}
+	// an old e2e3 message (no sealed time) reposted into the pair thread, or as a new conversation: refused
+	for _, ts := range [][2]string{{"600.1", "602.1"}, {"", "700.1"}} {
+		if err := a.onMessage(ctx, reply(owner, ts[0], ts[1], in)); err != nil {
+			t.Fatal(err)
+		}
+		if len(k.started) != 2 || a.isSealed("700.1") {
+			t.Fatalf("downgrade to e2e3 in %q accepted: started %d", ts[0], len(k.started))
+		}
+	}
 	// POWER's own pair reply posted under the owner's name is not the owner speaking
 	if err := a.onMessage(ctx, reply(owner, "600.1", "601.1", p[len(p)-2].Get("text"))); err != nil {
 		t.Fatal(err)
@@ -214,6 +224,7 @@ func TestE2EThread(t *testing.T) {
 
 	// a conversation sealed before kana (an "e2e3:" message, or a mark migrated from slack.json)
 	// keeps "e2e3:" both ways, and a later kana message does not switch it (that chat is started[2])
+	a.markSealed("350.1", "") // as the migration from slack.json marks it
 	if err := a.onMessage(ctx, reply(owner, "", "350.1", asLegacy(in))); err != nil {
 		t.Fatal(err)
 	}

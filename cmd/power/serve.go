@@ -534,6 +534,11 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 	if inThread {
 		sealKey = m.ThreadTimeStamp
 	}
+	// the forms without a sealed time are only taken in threads already sealed in them: otherwise Slack could
+	// repost an old e2e3 message as a new conversation, or into a pair thread, past the replay check
+	if readable && plain != m.Text && form != "pair" && (!a.isSealed(sealKey) || a.sealedForm(sealKey) == "pair") {
+		readable = false
+	}
 	if !readable { // e2e3 POWER cannot open: wrong key, not from the owner's key, tampered, or replayed
 		in.Error = "e2e3: unreadable"
 		a.record(in)
