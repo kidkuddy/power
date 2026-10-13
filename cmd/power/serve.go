@@ -431,6 +431,9 @@ func (a *adapter) onAction(ctx context.Context, cb slack.InteractionCallback) er
 		}
 		id, _, _ := strings.Cut(rest, ":")
 		val, readable := a.unseal(act.Value, "bot") // a sealed thread's buttons carry values POWER sealed
+		if readable && val != act.Value {
+			val = buttonValue(val)
+		}
 		e := entry{Dir: "in", Kind: "button", Channel: cb.Channel.ID, TS: cb.Message.Timestamp, User: cb.User.ID,
 			Text: val, Value: val, ContractID: id}
 		if !readable {

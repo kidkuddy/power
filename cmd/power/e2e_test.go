@@ -221,6 +221,10 @@ func TestE2EThread(t *testing.T) {
 	if strings.Contains(raw, `"type":"section"`) || !strings.Contains(raw, `"type":"rich_text"`) {
 		t.Fatalf("sealed text must go out as rich_text: %s", raw)
 	}
+	// sshhh labels each button from its own sealed value, never from the legend
+	if pv, err := e2eOpen(keepVal, ownerKey, botPub); err != nil || !strings.HasPrefix(pv, `{"label":`) || buttonValue(pv) != "keep" {
+		t.Fatalf("button value carries no label: %q %v", pv, err)
+	}
 	tap := tap(owner, "c9", keepVal)
 	tap.Channel.ID, tap.Message.Timestamp = "D1", "300.5"
 	if err := a.onAction(ctx, tap); err != nil {

@@ -296,6 +296,23 @@ func (a *adapter) markSealed(ts string) error {
 	return os.WriteFile(a.sealedPath(ts), nil, 0o600)
 }
 
+// sealedButton is the plaintext of a sealed button value.
+type sealedButton struct {
+	Label string `json:"label"`
+	Value string `json:"value"`
+}
+
+// buttonValue is the option value inside an opened button value. Values sealed
+// before labels rode along are the bare option value.
+// ponytail: an option value that itself starts with {"label": would be misread; none does
+func buttonValue(plain string) string {
+	var b sealedButton
+	if strings.HasPrefix(plain, `{"label":`) && json.Unmarshal([]byte(plain), &b) == nil {
+		return b.Value
+	}
+	return plain
+}
+
 func sealedText(s string) bool { return strings.HasPrefix(strings.TrimSpace(s), e2ePrefix) }
 
 // unseal is the plaintext of a message sealed by the key of who ("owner" or
@@ -381,17 +398,20 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 					continue // a select or picker would show its options: dropped
 				}
 				n := len(els) + 1
-				v, err := seal(btn.Value)
+				label := btn.Value
+				if btn.Text != nil {
+					label = btn.Text.Text
+				}
+				// the label rides inside the sealed value, so sshhh can draw it on this very button:
+				// a label read from the legend could be put on any "Option n" button
+				pv, _ := json.Marshal(sealedButton{Label: label, Value: btn.Value})
+				v, err := seal(string(pv))
 				if err != nil {
 					return "", nil, false, err
 				}
 				nb := slack.NewButtonBlockElement(btn.ActionID, v, slack.NewTextBlockObject(slack.PlainTextType, fmt.Sprintf("Option %d", n), false, false))
 				nb.Style = btn.Style
 				els = append(els, nb)
-				label := btn.Value
-				if btn.Text != nil {
-					label = btn.Text.Text
-				}
 				legend = append(legend, fmt.Sprintf("Option %d: %s", n, label))
 			}
 			if len(els) == 0 {
