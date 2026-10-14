@@ -193,6 +193,10 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "chat.update":
 		out = map[string]any{"channel": "D1", "ts": r.Form.Get("ts")}
 	case "canvases.create":
+		if strings.Contains(r.Form.Get("document_content"), "nested") {
+			out = map[string]any{"ok": false, "error": "canvas_creation_failed", "detail": "line 2: Unsupported list type (numbered) within bullet list"}
+			break
+		}
 		s.n++
 		out = map[string]any{"canvas_id": fmt.Sprintf("F%d", s.n)}
 	case "conversations.replies":
@@ -228,6 +232,7 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if _, set := out["ok"]; !set {
 		out["ok"] = true
 	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(out)
 }
 
@@ -266,7 +271,7 @@ func setup(t *testing.T) (*fakeKami, *fakeSlack, func() *adapter) {
 	s.url = ss.URL
 	t.Cleanup(ss.Close)
 	start := func() *adapter {
-		a := &adapter{api: slack.New("xoxb-fake", slack.OptionAPIURL(ss.URL+"/")), kami: kamiClient(sock),
+		a := &adapter{api: slack.New("xoxb-fake", slack.OptionAPIURL(ss.URL+"/"), slack.OptionHTTPClient(detailClient{http.DefaultClient})), kami: kamiClient(sock),
 			owner: owner, dir: filepath.Join(dir, "adapters"), chatKekkai: "work", chatWorkflow: "chat", replyAnswers: true}
 		if err := a.load(); err != nil {
 			t.Fatal(err)
@@ -386,7 +391,10 @@ func TestCanvasAndDM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u1 != u2 || len(s.of("canvases.create")) != 1 || len(s.of("canvases.edit")) != 1 {
+	if _, err := a.canvas(ctx, "", "Bad", "- nested", nil); err == nil || !strings.Contains(err.Error(), "line 2: Unsupported list type") {
+		t.Fatalf("canvas error lost Slack's detail: %v", err)
+	}
+	if u1 != u2 || len(s.of("canvases.create")) != 2 || len(s.of("canvases.edit")) != 1 {
 		t.Fatalf("keyed canvas: %s %s, %d creates", u1, u2, len(s.of("canvases.create")))
 	}
 	acc := s.of("canvases.access.set")

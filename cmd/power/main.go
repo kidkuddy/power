@@ -127,7 +127,8 @@ func main() {
 		log.Fatalf("power: SLACK_BOT_TOKEN and NIFFTY_OWNER_ID must be set in %s", *envPath)
 	}
 	a := &adapter{
-		api:          slack.New(env["SLACK_BOT_TOKEN"], slack.OptionAppLevelToken(env["SLACK_APP_TOKEN"])),
+		api: slack.New(env["SLACK_BOT_TOKEN"], slack.OptionAppLevelToken(env["SLACK_APP_TOKEN"]),
+			slack.OptionHTTPClient(detailClient{http.DefaultClient})),
 		kami:         kamiClient(*sock),
 		owner:        env["NIFFTY_OWNER_ID"],
 		kekkai:       *kek,
@@ -500,6 +501,33 @@ func (a *adapter) writeCanvas(ctx context.Context, key, title, markdown string, 
 		}
 	}
 	return a.permalink(ctx, id)
+}
+
+// detailClient folds a failed call's `detail` into its `error`: slack-go keeps only the code
+// (canvas_creation_failed), and the detail is the part that says what to fix
+// ("line 44: Unsupported list type (numbered) within bullet list").
+type detailClient struct{ c *http.Client }
+
+func (d detailClient) Do(req *http.Request) (*http.Response, error) {
+	resp, err := d.c.Do(req)
+	if err != nil || !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+		return resp, err
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	var r map[string]any
+	if json.Unmarshal(body, &r) == nil && r["ok"] == false {
+		if detail, _ := r["detail"].(string); detail != "" {
+			r["error"] = fmt.Sprintf("%v: %s", r["error"], detail)
+			body, _ = json.Marshal(r)
+		}
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	return resp, nil
 }
 
 func (a *adapter) permalink(ctx context.Context, id string) (string, error) {
