@@ -304,7 +304,7 @@ type adapter struct {
 // post fails). Blocks are optional; text is always sent as the notification fallback.
 func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (string, string, error) {
 	e.Dir = "out"
-	im, err := e.Channel, error(nil)
+	im, err, sealed := e.Channel, error(nil), false
 	if im == "" {
 		im, err = a.dm(ctx)
 	}
@@ -316,6 +316,7 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 			a.record(e)
 			return "", "", err
 		}
+		sealed = text != e.Text
 		opts := []slack.MsgOption{slack.MsgOptionText(text, false)}
 		if blocks != nil {
 			opts = append(opts, slack.MsgOptionBlocks(blocks...))
@@ -337,7 +338,27 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 		return "", "", err
 	}
 	a.record(e)
+	if e.Text != "" && sealed {
+		a.postCanvasCards(ctx, e.Channel, e.ThreadTS, e.Text)
+	}
 	return e.Channel, e.TS, nil
+}
+
+var canvasLink = regexp.MustCompile(`https://[a-z0-9-]+\.slack\.com/docs/T[A-Z0-9]+/F[A-Z0-9]+`)
+
+// postCanvasCards repeats each canvas link of a sealed post as its own plaintext
+// message: Slack cannot unfurl a link inside ciphertext, and the canvas itself
+// is plaintext on Slack already, so only the link's thread is new to it.
+func (a *adapter) postCanvasCards(ctx context.Context, channel, thread, text string) {
+	for _, u := range canvasLink.FindAllString(text, -1) {
+		opts := []slack.MsgOption{slack.MsgOptionText(u, false), slack.MsgOptionEnableLinkUnfurl()}
+		if thread != "" {
+			opts = append(opts, slack.MsgOptionTS(thread))
+		}
+		if _, _, err := a.api.PostMessageContext(ctx, channel, opts...); err != nil {
+			log.Printf("power: canvas card %s: %v", u, err)
+		}
+	}
 }
 
 // directory prints the owner, the owner's DM channel and every person's

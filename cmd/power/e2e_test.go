@@ -222,6 +222,14 @@ func TestE2EThread(t *testing.T) {
 		t.Fatalf("bot pair text accepted as owner: started %d", len(k.started))
 	}
 
+	// a canvas link in a sealed reply: the reply stays sealed, the link follows in plaintext so Slack shows the card
+	const cv = "https://x.slack.com/docs/T08HYL07A07/F0C99M5TCAG"
+	a.post(ctx, entry{ThreadTS: "600.1", Text: "canvas is up: " + cv + " (secret)"}, nil)
+	p = s.of("chat.postMessage")
+	if card, rep := p[len(p)-1], p[len(p)-2]; card.Get("text") != cv || card.Get("thread_ts") != "600.1" || card.Get("unfurl_links") != "true" || strings.Contains(rep.Get("text"), "secret") {
+		t.Fatalf("canvas card %v after %v", card, rep)
+	}
+
 	// a conversation sealed before kana (an "e2e3:" message, or a mark migrated from slack.json)
 	// keeps "e2e3:" both ways, and a later kana message does not switch it (that chat is started[2])
 	a.markSealed("350.1", "") // as the migration from slack.json marks it
