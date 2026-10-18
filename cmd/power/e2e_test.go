@@ -533,3 +533,53 @@ func TestE2ESealKekkai(t *testing.T) {
 		t.Fatalf("plaintext not refused: %v %v posts %d→%d", errC, errT, n, len(s.of("chat.postMessage")))
 	}
 }
+
+// A reply in a thread owned by an active run of another kekkai (a life check-in) goes to that
+// kekkai: queued while its run is not listening, never a work chat, delivered once it waits.
+func TestRouteOtherKekkai(t *testing.T) {
+	ctx := context.Background()
+	k, _, start := setup(t)
+	a := start()
+	k.mu.Lock()
+	k.runs["rlife"] = map[string]any{"id": "rlife", "workflow": "spec", "kekkai": "life", "vars": map[string]any{"thread_ts": "800.1"}}
+	k.runs["rother"] = map[string]any{"id": "rother", "workflow": "x", "kekkai": "other", "vars": map[string]any{"thread_ts": "900.1"}}
+	k.waitIn = map[string]string{}
+	k.mu.Unlock()
+	ownerKey, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	ownerPub := ownerKey.PublicKey().Bytes()
+	if _, err := e2eSetup(a.dir, base64.StdEncoding.EncodeToString(ownerPub)); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if a.e2e, err = loadSealer(a.dir); err != nil {
+		t.Fatal(err)
+	}
+	a.e2e.kekkai = map[string]bool{"life": true}
+	a.markSealed("800.1", "pair")
+	a.markSealed("900.1", "pair")
+	// a kekkai not in seal_kekkai claiming a thread (its worker set thread_ts) gets nothing
+	if kek, err := a.threadKekkai("900.1"); err != nil || kek != "work" {
+		t.Fatalf("untrusted kekkai got the thread: %q %v", kek, err)
+	}
+	// a plaintext thread is never handed to life, even with a life run on it
+	k.runs["rlife"]["vars"] = map[string]any{"thread_ts": "950.1"}
+	if kek, _ := a.threadKekkai("950.1"); kek != "work" {
+		t.Fatalf("plaintext thread routed to %q", kek)
+	}
+	k.runs["rlife"]["vars"] = map[string]any{"thread_ts": "800.1"}
+	if err := a.onMessage(ctx, reply(owner, "800.1", "800.2", ownerPair(t, "the deliverable is a PR", ownerKey, a.e2e.me.PublicKey(), time.Now()))); err != nil {
+		t.Fatal(err)
+	}
+	if len(k.started) != 0 || len(a.st.Queue["800.1"]) != 1 || k.signals[len(k.signals)-1]["kekkai"] != "life" {
+		t.Fatalf("not listening: started %v queue %v signals %v", k.started, a.st.Queue, k.signals)
+	}
+	k.mu.Lock()
+	k.waitIn["800.1"] = "life"
+	k.mu.Unlock()
+	if err := a.route(ctx, "800.1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(k.started) != 0 || len(a.st.Queue["800.1"]) != 0 {
+		t.Fatalf("listening: started %v queue %v", k.started, a.st.Queue)
+	}
+}

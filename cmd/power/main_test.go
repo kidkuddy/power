@@ -1199,30 +1199,3 @@ func TestOwnerImage(t *testing.T) {
 		t.Fatalf("conversations.open = %v", o)
 	}
 }
-
-// A reply in a thread owned by an active run of another kekkai (a life check-in) goes to that
-// kekkai: queued while its run is not listening, never a work chat, delivered once it waits.
-func TestRouteOtherKekkai(t *testing.T) {
-	ctx := context.Background()
-	k, _, start := setup(t)
-	a := start()
-	k.mu.Lock()
-	k.runs["rlife"] = map[string]any{"id": "rlife", "workflow": "spec", "kekkai": "life", "vars": map[string]any{"thread_ts": "800.1"}}
-	k.waitIn = map[string]string{}
-	k.mu.Unlock()
-	if err := a.onMessage(ctx, reply(owner, "800.1", "800.2", "the deliverable is a PR")); err != nil {
-		t.Fatal(err)
-	}
-	if len(k.started) != 0 || len(a.st.Queue["800.1"]) != 1 || k.signals[len(k.signals)-1]["kekkai"] != "life" {
-		t.Fatalf("not listening: started %v queue %v signals %v", k.started, a.st.Queue, k.signals)
-	}
-	k.mu.Lock()
-	k.waitIn["800.1"] = "life"
-	k.mu.Unlock()
-	if err := a.route(ctx, "800.1"); err != nil {
-		t.Fatal(err)
-	}
-	if len(k.started) != 0 || len(a.st.Queue["800.1"]) != 0 {
-		t.Fatalf("listening: started %v queue %v", k.started, a.st.Queue)
-	}
-}

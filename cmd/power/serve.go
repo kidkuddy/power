@@ -701,8 +701,12 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 }
 
 // threadKekkai is the kekkai a thread's replies go to: that of an active run of another
-// kekkai tied to the thread (a life check-in), else --chat-kekkai.
+// kekkai tied to the thread (a life check-in), else --chat-kekkai. Any worker can set a
+// thread_ts var, so only a seal_kekkai kekkai is trusted, and only in a thread POWER sealed.
 func (a *adapter) threadKekkai(key string) (string, error) {
+	if a.e2e == nil || len(a.e2e.kekkai) == 0 || !a.isSealed(key) {
+		return a.chatKekkai, nil
+	}
 	var runs []struct {
 		Kekkai string `json:"kekkai"`
 	}
@@ -711,7 +715,7 @@ func (a *adapter) threadKekkai(key string) (string, error) {
 		return "", err
 	}
 	for _, r := range runs {
-		if r.Kekkai != "" && r.Kekkai != a.chatKekkai {
+		if r.Kekkai != a.chatKekkai && a.e2e.kekkai[r.Kekkai] {
 			return r.Kekkai, nil
 		}
 	}
