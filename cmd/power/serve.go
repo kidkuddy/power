@@ -203,14 +203,28 @@ func (a *adapter) milestone(ctx context.Context, ev kami.Event) error {
 			}
 		}
 	}
-	_, _, err = a.post(ctx, entry{Kind: "milestone", ThreadTS: l.thread, Text: text, RunID: ev.Run, Workflow: l.workflow}, nil)
+	_, ts, err := a.post(ctx, entry{Kind: "milestone", ThreadTS: l.thread, Text: text, RunID: ev.Run, Workflow: l.workflow}, nil)
 	if badThread(err) {
 		return nil // a thread_ts that is not a thread of the owner DM: the error entry is the record
+	}
+	if err == nil && ev.Type == "run.finished" && l.parent == "" && l.workflow == a.chatWorkflow && ev.Data["status"] == kami.StDone {
+		a.asleep(ctx, l.thread, ts)
 	}
 	if err == nil && ev.Type == "run.finished" && l.parent == "" && l.workflow != a.chatWorkflow {
 		a.tellChat(l.thread, "[kami] "+strings.TrimPrefix(strings.TrimPrefix(text, "✅ "), "❌ ")+" (run "+ev.Run+")")
 	}
 	return err
+}
+
+// asleep keeps one note of a chat going to sleep per thread, the newest: the
+// chat sleeps after every answer, and each note was one more post (13 in a thread).
+func (a *adapter) asleep(ctx context.Context, thread, ts string) {
+	if old := a.st.Asleep[thread]; old != "" {
+		if _, _, err := a.api.DeleteMessageContext(ctx, a.im, old); err != nil {
+			log.Printf("power: delete old asleep note %s: %v", old, err)
+		}
+	}
+	a.st.Asleep[thread] = ts
 }
 
 // tellChat signals the chat run listening on a thread, if any: a top-level run

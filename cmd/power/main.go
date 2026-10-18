@@ -631,6 +631,7 @@ type state struct {
 	Banter  map[string]int       `json:"banter,omitempty"` // coworker -> messages handed to a session on Day
 	Convs   map[string][]convMsg `json:"convs,omitempty"`  // conversation key -> messages waiting while its session is busy
 	Sealed  map[string]bool      `json:"sealed,omitempty"` // read once to move into e2e-sealed/ (see markSealed), then dropped
+	Asleep  map[string]string    `json:"asleep,omitempty"` // chat thread -> its note of the chat going to sleep
 }
 
 type queued struct {
@@ -652,7 +653,7 @@ type thread struct {
 func (a *adapter) statePath() string { return filepath.Join(a.dir, "slack.json") }
 
 func (a *adapter) load() error {
-	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}, Convs: map[string][]convMsg{}}
+	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}, Convs: map[string][]convMsg{}, Asleep: map[string]string{}}
 	raw, err := os.ReadFile(a.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -677,6 +678,9 @@ func (a *adapter) load() error {
 	}
 	if a.st.Convs == nil {
 		a.st.Convs = map[string][]convMsg{}
+	}
+	if a.st.Asleep == nil {
+		a.st.Asleep = map[string]string{}
 	}
 	for ts := range a.st.Sealed { // older builds kept sealed threads in this file
 		if err := a.markSealed(ts, ""); err != nil {

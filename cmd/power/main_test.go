@@ -222,7 +222,7 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "files.completeUploadExternal":
 		out = map[string]any{"files": []map[string]any{{"id": "FPIC", "title": "power.gif"}}}
-	case "canvases.edit", "canvases.access.set", "reactions.add", "pins.add", "pins.remove":
+	case "canvases.edit", "canvases.access.set", "reactions.add", "pins.add", "pins.remove", "chat.delete":
 		out = map[string]any{}
 	case "files.info":
 		out = map[string]any{"file": map[string]any{"id": r.Form.Get("file"), "permalink": "https://x.slack.com/docs/T1/" + r.Form.Get("file")}}
@@ -965,11 +965,18 @@ func TestRefusedEventDoesNotBlock(t *testing.T) {
 	if err := a.events(ctx); err != nil || a.st.Since != 2 || len(s.of("chat.postMessage")) != 2 {
 		t.Fatalf("msg_too_long held the cursor: %v since %d posts %d", err, a.st.Since, len(s.of("chat.postMessage")))
 	}
+	// the chat going to sleep again in a thread: the older note goes
+	k.mu.Lock()
+	k.events = append(k.events, fin(3, "r700.1"))
+	k.mu.Unlock()
+	if err := a.events(ctx); err != nil || len(s.of("chat.delete")) != 1 || s.of("chat.delete")[0].Get("ts") != "100.1" || a.st.Asleep["700.1"] != "100.2" {
+		t.Fatalf("asleep notes: %v deletes %v state %v", err, s.of("chat.delete"), a.st.Asleep)
+	}
 	// a refusal that may pass (internal_error) keeps the event for the next poll
 	k.mu.Lock()
-	k.events = append(k.events, fin(3, "r997.9"), fin(4, "r700.1"))
+	k.events = append(k.events, fin(4, "r997.9"), fin(5, "r700.1"))
 	k.mu.Unlock()
-	if err := a.events(ctx); err == nil || a.st.Since != 2 {
+	if err := a.events(ctx); err == nil || a.st.Since != 3 {
 		t.Fatalf("internal_error dropped the event: %v since %d", err, a.st.Since)
 	}
 }
