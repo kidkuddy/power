@@ -38,11 +38,15 @@ const (
 type e2eKeys struct {
 	Key   string `json:"key"`   // base64 X25519 private key: a secret, never logged
 	Owner string `json:"owner"` // base64 X25519 public key of the owner's Mac
+	// SealKekkai: kekkais whose runs only ever post sealed: a run with no thread yet opens a
+	// sealed one, and a post that cannot be sealed is refused instead of sent in plaintext.
+	SealKekkai []string `json:"seal_kekkai,omitempty"`
 }
 
 type sealer struct {
-	me    *ecdh.PrivateKey
-	owner *ecdh.PublicKey
+	me     *ecdh.PrivateKey
+	owner  *ecdh.PublicKey
+	kekkai map[string]bool // e2eKeys.SealKekkai
 }
 
 func e2ePath(dir string) string { return filepath.Join(dir, "e2e.json") }
@@ -71,7 +75,11 @@ func loadSealer(dir string) (*sealer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s owner: %v", e2ePath(dir), err)
 	}
-	return &sealer{me, owner}, nil
+	kek := map[string]bool{}
+	for _, k := range k.SealKekkai {
+		kek[k] = true
+	}
+	return &sealer{me, owner, kek}, nil
 }
 
 // e2eSetup makes POWER's key on first use, records the owner's key when given,
@@ -512,30 +520,50 @@ func (a *adapter) unsealForm(text, who string) (plain, form string, sealedAt tim
 // the owner DM, the text and every section and context text are ciphertext;
 // buttons become "Option n" with a sealed value, explained by a sealed legend;
 // any other block or element (accessories, selects, headers) is dropped, never sent.
+// run is the run the post speaks for (a contract's or milestone's; empty: $KAMI_RUN of a script step).
 // newRoot is a sealed top-level post: the thread under it must be marked sealed once posted.
-func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blocks []slack.Block) (_ string, _ []slack.Block, newRoot bool, _ error) {
+func (a *adapter) sealOut(ctx context.Context, channel, thread, run, text string, blocks []slack.Block) (_ string, _ []slack.Block, newRoot bool, _ error) {
 	if a.e2e == nil {
 		return text, blocks, false, nil
 	}
-	key := thread
-	if key == "" && a.run != "" {
+	if run == "" {
+		run = a.run
+	}
+	key, kek, sealedKek := thread, "", false
+	if run != "" && (key == "" || len(a.e2e.kekkai) > 0) {
 		// a script step posting a new root (launch's 🧵 thread for "thread me ..."): sealed when the
 		// conversation its run speaks for is, or the request would leave in plaintext in a new thread
-		l, err := a.runLink(a.run, 0)
+		l, err := a.runLink(run, 0)
 		if err != nil {
-			return "", nil, false, fmt.Errorf("e2e: thread of run %s: %w", a.run, err)
+			return "", nil, false, fmt.Errorf("e2e: thread of run %s: %w", run, err)
 		}
-		key = l.thread
+		if key == "" {
+			key = l.thread
+		}
+		kek, sealedKek = l.kekkai, a.e2e.kekkai[l.kekkai]
 	}
+	fresh := false // a sealed kekkai's run with no thread yet: this post opens a sealed one
 	if key == "" || !a.isSealed(key) {
-		return text, blocks, false, nil
+		switch {
+		case !sealedKek:
+			return text, blocks, false, nil
+		case key != "":
+			return "", nil, false, fmt.Errorf("e2e: run %s of sealed kekkai %s posts into plaintext thread %s: refused", run, kek, key)
+		}
+		fresh = true
 	}
 	if im, err := a.dm(ctx); err != nil {
 		return "", nil, false, err
 	} else if channel != "" && channel != im {
+		if sealedKek {
+			return "", nil, false, fmt.Errorf("e2e: run %s of sealed kekkai %s posts to channel %s: only the owner DM is sealed, refused", run, kek, channel)
+		}
 		return text, blocks, false, nil // the key is the owner DM's thread ts; another channel's thread is not sealed
 	}
-	form := a.sealedForm(key)
+	form := "pair"
+	if !fresh {
+		form = a.sealedForm(key)
+	}
 	seal := func(s string) (string, error) {
 		if strings.TrimSpace(s) == "" {
 			return s, nil
@@ -626,10 +654,14 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 	return st, out, thread == "", nil
 }
 
-// newRootForm is the form a sealed new root (sealOut's newRoot) is marked with: its run's thread's.
-func (a *adapter) newRootForm(thread string) string {
-	if thread == "" && a.run != "" {
-		if l, err := a.runLink(a.run, 0); err == nil {
+// newRootForm is the form a sealed new root (sealOut's newRoot) is marked with: its run's thread's,
+// or pair when the run has no sealed thread yet (a sealed kekkai's first post).
+func (a *adapter) newRootForm(thread, run string) string {
+	if run == "" {
+		run = a.run
+	}
+	if thread == "" && run != "" {
+		if l, err := a.runLink(run, 0); err == nil && l.thread != "" && a.isSealed(l.thread) {
 			return a.sealedForm(l.thread)
 		}
 	}

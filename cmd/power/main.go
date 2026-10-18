@@ -311,7 +311,7 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 	if err == nil {
 		text := e.Text // the transcript keeps the plaintext; Slack gets ciphertext in a sealed thread
 		var newRoot bool
-		if text, blocks, newRoot, err = a.sealOut(ctx, e.Channel, e.ThreadTS, text, blocks); err != nil {
+		if text, blocks, newRoot, err = a.sealOut(ctx, e.Channel, e.ThreadTS, e.RunID, text, blocks); err != nil {
 			e.Kind, e.Error = "error", "seal: "+err.Error()
 			a.record(e)
 			return "", "", err
@@ -327,7 +327,7 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 		if e.Channel, e.TS, err = a.api.PostMessageContext(ctx, im, opts...); err != nil {
 			err = fmt.Errorf("post message: %w", err)
 		} else if newRoot {
-			if err = a.markSealed(e.TS, a.newRootForm(e.ThreadTS)); err != nil { // posted sealed, but its thread would not stay sealed
+			if err = a.markSealed(e.TS, a.newRootForm(e.ThreadTS, e.RunID)); err != nil { // posted sealed, but its thread would not stay sealed
 				err = fmt.Errorf("posted %s sealed but could not mark its thread: %w", e.TS, err)
 			}
 		}

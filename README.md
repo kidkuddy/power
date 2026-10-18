@@ -81,7 +81,12 @@ With [sshhh](https://github.com/kidkuddy/sshhh) on the owner's Mac, a DM written
 seals its thread: POWER decrypts what the owner writes (and the thread history) for the chat, and
 everything she posts or redraws there goes to Slack as ciphertext only. Keys live in
 `$KAMI_HOME/adapters/e2e.json` (0600); without that file nothing is sealed. Set it up with
-`power e2e <the key sshhh prints>`, then give sshhh POWER's key (`E2E_PEERS`). Button labels,
+`power e2e <the key sshhh prints>`, then give sshhh POWER's key (`E2E_PEERS`).
+
+A kekkai listed under `"seal_kekkai"` in `e2e.json` (e.g. `["life"]`) only ever posts sealed: a run
+there that has no thread yet (a cron check-in) opens a new sealed thread, and a post that cannot be
+sealed (another channel, a plaintext thread) is refused instead of sent. Replies in a thread owned by
+an active run of another kekkai go to that kekkai, not to `--chat-kekkai`. Button labels,
 uploaded images, reactions and who-wrote-when stay visible to Slack.
 
 ## Audit

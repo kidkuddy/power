@@ -456,3 +456,80 @@ func TestCardBudget(t *testing.T) {
 		}
 	}
 }
+
+// A run of a seal_kekkai kekkai (life) with no thread yet opens a sealed thread, its contracts
+// and milestones there stay sealed, and a post that would leave in plaintext is refused.
+func TestE2ESealKekkai(t *testing.T) {
+	ctx := context.Background()
+	k, s, start := setup(t)
+	a := start()
+	ownerKey, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	if _, err := e2eSetup(a.dir, base64.StdEncoding.EncodeToString(ownerKey.PublicKey().Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(e2ePath(a.dir))
+	var keys e2eKeys
+	json.Unmarshal(raw, &keys)
+	keys.SealKekkai = []string{"life"}
+	raw, _ = json.Marshal(keys)
+	os.WriteFile(e2ePath(a.dir), raw, 0o600)
+	if _, err := e2eSetup(a.dir, ""); err != nil { // re-running setup keeps the list
+		t.Fatal(err)
+	}
+	var err error
+	if a.e2e, err = loadSealer(a.dir); err != nil || !a.e2e.kekkai["life"] {
+		t.Fatalf("sealer: %v %v", a.e2e, err)
+	}
+	k.mu.Lock()
+	k.runs["rlife"] = map[string]any{"id": "rlife", "workflow": "daily", "kekkai": "life", "vars": map[string]any{}}
+	k.runs["rwork"] = map[string]any{"id": "rwork", "workflow": "morning", "kekkai": "work", "vars": map[string]any{}}
+	k.mu.Unlock()
+
+	// the cron run's first post (a script's `power dm`): a sealed new root, in pair form
+	a.run = "rlife"
+	_, root, err := a.post(ctx, entry{Text: "☀️ daily: the secret plan"}, nil)
+	a.run = ""
+	p := s.of("chat.postMessage")
+	pb, _ := e2eDecode(p[len(p)-1].Get("text"))
+	if pt, _, _, oerr := e2ePairOpen(pb, a.e2e.me, ownerKey.PublicKey()); err != nil || oerr != nil || pt != "☀️ daily: the secret plan" || !a.isSealed(root) || a.sealedForm(root) != "pair" {
+		t.Fatalf("root %v: %q %v %v sealed %v", err, pt, oerr, p[len(p)-1], a.isSealed(root))
+	}
+
+	// a contract of a thread-less life run (serve passes the run id): sealed too
+	if _, _, err := a.post(ctx, entry{Kind: "contract", Text: "secret question", RunID: "rlife"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	p = s.of("chat.postMessage")
+	if got := p[len(p)-1].Get("text"); strings.Contains(got, "secret") || !sealedText(got) {
+		t.Fatalf("contract leaked: %q", got)
+	}
+
+	// another kekkai's thread-less run stays plaintext, as before
+	a.run = "rwork"
+	a.post(ctx, entry{Text: "work plan"}, nil)
+	a.run = ""
+	p = s.of("chat.postMessage")
+	if got := p[len(p)-1].Get("text"); got != "work plan" {
+		t.Fatalf("work run sealed: %q", got)
+	}
+
+	// once the life run has a thread, posts there are sealed
+	k.mu.Lock()
+	k.runs["rlife"]["vars"] = map[string]any{"thread_ts": root}
+	k.mu.Unlock()
+	a.post(ctx, entry{ThreadTS: root, Text: "milestone secret", RunID: "rlife"}, nil)
+	p = s.of("chat.postMessage")
+	if got := p[len(p)-1].Get("text"); strings.Contains(got, "secret") || !sealedText(got) {
+		t.Fatalf("milestone leaked: %q", got)
+	}
+
+	// refused, never sent: a life run posting to another channel or into a plaintext thread
+	n := len(s.of("chat.postMessage"))
+	a.run = "rlife"
+	_, _, errC := a.post(ctx, entry{Channel: "C9", Text: "secret elsewhere"}, nil)
+	_, _, errT := a.post(ctx, entry{ThreadTS: "400.1", Text: "secret in plain thread"}, nil)
+	a.run = ""
+	if errC == nil || errT == nil || len(s.of("chat.postMessage")) != n {
+		t.Fatalf("plaintext not refused: %v %v posts %d→%d", errC, errT, n, len(s.of("chat.postMessage")))
+	}
+}

@@ -32,8 +32,9 @@ type fakeKami struct {
 	resolves  []string // "id=answer data"
 
 	signals []map[string]any
-	waiting map[string]bool // thread key -> a chat run waits on slack.message
-	busy    map[string]bool // thread key -> an active chat run is working
+	waitIn  map[string]string // thread -> the kekkai (not work) of a run waiting on it
+	waiting map[string]bool   // thread key -> a chat run waits on slack.message
+	busy    map[string]bool   // thread key -> an active chat run is working
 	started []map[string]any
 	runs    map[string]map[string]any // run id -> {"workflow", "parent", "vars"}
 }
@@ -67,8 +68,9 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		json.NewDecoder(r.Body).Decode(&req)
 		k.signals = append(k.signals, req)
 		key, _ := req["key"].(string)
-		if req["kekkai"] == "work" && req["type"] == "slack.message" && k.waiting[key] {
+		if req["type"] == "slack.message" && (req["kekkai"] == "work" && k.waiting[key] || k.waitIn[key] != "" && req["kekkai"] == k.waitIn[key]) {
 			delete(k.waiting, key)
+			delete(k.waitIn, key)
 			env(w, map[string]any{"delivered": []string{"run-" + key}}, "", "")
 			return
 		}
@@ -85,6 +87,13 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		}
 		if ck, isConv := strings.CutPrefix(q.Get("var"), "kami_key="); isConv && q.Get("status") == "active" && k.busy[ck] {
 			runs = append(runs, map[string]any{"id": "run-" + ck, "workflow": "converse", "status": "running"})
+		}
+		if ok && q.Get("status") == "active" && q.Get("kekkai") == "" {
+			for id, run := range k.runs {
+				if vars, _ := run["vars"].(map[string]any); vars["thread_ts"] == key && run["kekkai"] != nil {
+					runs = append(runs, map[string]any{"id": id, "workflow": run["workflow"], "kekkai": run["kekkai"]})
+				}
+			}
 		}
 		if name, val, isVar := strings.Cut(q.Get("var"), "="); isVar && q.Get("status") == "" {
 			for id, run := range k.runs {
@@ -1188,5 +1197,32 @@ func TestOwnerImage(t *testing.T) {
 	}
 	if o := s.of("conversations.open"); len(o) == 0 || o[len(o)-1].Get("users") != "U2" {
 		t.Fatalf("conversations.open = %v", o)
+	}
+}
+
+// A reply in a thread owned by an active run of another kekkai (a life check-in) goes to that
+// kekkai: queued while its run is not listening, never a work chat, delivered once it waits.
+func TestRouteOtherKekkai(t *testing.T) {
+	ctx := context.Background()
+	k, _, start := setup(t)
+	a := start()
+	k.mu.Lock()
+	k.runs["rlife"] = map[string]any{"id": "rlife", "workflow": "spec", "kekkai": "life", "vars": map[string]any{"thread_ts": "800.1"}}
+	k.waitIn = map[string]string{}
+	k.mu.Unlock()
+	if err := a.onMessage(ctx, reply(owner, "800.1", "800.2", "the deliverable is a PR")); err != nil {
+		t.Fatal(err)
+	}
+	if len(k.started) != 0 || len(a.st.Queue["800.1"]) != 1 || k.signals[len(k.signals)-1]["kekkai"] != "life" {
+		t.Fatalf("not listening: started %v queue %v signals %v", k.started, a.st.Queue, k.signals)
+	}
+	k.mu.Lock()
+	k.waitIn["800.1"] = "life"
+	k.mu.Unlock()
+	if err := a.route(ctx, "800.1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(k.started) != 0 || len(a.st.Queue["800.1"]) != 0 {
+		t.Fatalf("listening: started %v queue %v", k.started, a.st.Queue)
 	}
 }

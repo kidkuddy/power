@@ -273,7 +273,7 @@ func permanent(err error) bool {
 	return false
 }
 
-type link struct{ thread, workflow, parent, root string } // root: the top-level run's id
+type link struct{ thread, workflow, parent, root, kekkai string } // root: the top-level run's id
 
 // runLink finds a run's Slack thread: its var thread_ts, else its parent's,
 // up the chain. Only runs with a thread are cached: a run may set thread_ts later.
@@ -284,6 +284,7 @@ func (a *adapter) runLink(id string, depth int) (link, error) {
 	var r struct {
 		Workflow string         `json:"workflow"`
 		Parent   string         `json:"parent"`
+		Kekkai   string         `json:"kekkai"`
 		Vars     map[string]any `json:"vars"`
 	}
 	err := a.kamiCall("GET", "/runs/"+url.PathEscape(id), nil, &r)
@@ -294,7 +295,7 @@ func (a *adapter) runLink(id string, depth int) (link, error) {
 	if err != nil {
 		return link{}, err
 	}
-	l := link{workflow: r.Workflow, parent: r.Parent, root: id}
+	l := link{workflow: r.Workflow, parent: r.Parent, root: id, kekkai: r.Kekkai}
 	l.thread, _ = r.Vars["thread_ts"].(string)
 	if r.Parent != "" && depth < 32 {
 		p, err := a.runLink(r.Parent, depth+1)
@@ -420,7 +421,7 @@ func (a *adapter) settle(ctx context.Context, id string, t *thread, line string)
 	var text string
 	var blocks []slack.Block
 	if err == nil {
-		text, blocks, _, err = a.sealOut(ctx, im, t.Thread, line,
+		text, blocks, _, err = a.sealOut(ctx, im, t.Thread, t.RunID, line,
 			[]slack.Block{section(t.Text), slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, line, false, false))})
 	}
 	if err == nil {
@@ -452,7 +453,7 @@ func (a *adapter) unsettled(ctx context.Context, cb slack.InteractionCallback) e
 		}
 		keep = append(keep, b)
 	}
-	text, blocks, _, err := a.sealOut(ctx, cb.Channel.ID, cb.Message.ThreadTimestamp, note,
+	text, blocks, _, err := a.sealOut(ctx, cb.Channel.ID, cb.Message.ThreadTimestamp, "", note,
 		[]slack.Block{slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, note, false, false))})
 	if err == nil {
 		_, _, _, err = a.api.UpdateMessageContext(ctx, cb.Channel.ID, cb.Message.Timestamp, slack.MsgOptionText(text, false),
@@ -699,6 +700,24 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 	return err
 }
 
+// threadKekkai is the kekkai a thread's replies go to: that of an active run of another
+// kekkai tied to the thread (a life check-in), else --chat-kekkai.
+func (a *adapter) threadKekkai(key string) (string, error) {
+	var runs []struct {
+		Kekkai string `json:"kekkai"`
+	}
+	v := url.Values{"status": {"active"}, "var": {"thread_ts=" + key}}
+	if err := a.kamiCall("GET", "/runs?"+v.Encode(), nil, &runs); err != nil {
+		return "", err
+	}
+	for _, r := range runs {
+		if r.Kekkai != "" && r.Kekkai != a.chatKekkai {
+			return r.Kekkai, nil
+		}
+	}
+	return a.chatKekkai, nil
+}
+
 func (a *adapter) routed(how, key string, q queued) entry {
 	return entry{Dir: "in", Kind: "chat_routed", Channel: a.im, TS: q.TS, ThreadTS: key, Text: q.Text, Routed: how, Workflow: a.chatWorkflow}
 }
@@ -722,10 +741,14 @@ func (a *adapter) route(ctx context.Context, key string) error {
 		delete(a.st.Queue, key)
 		return nil
 	}
+	kek, err := a.threadKekkai(key)
+	if err != nil {
+		return err
+	}
 	var sig struct {
 		Delivered []string `json:"delivered"`
 	}
-	err := a.kamiCall("POST", "/signal", map[string]any{"kekkai": a.chatKekkai, "type": "slack.message", "key": key,
+	err = a.kamiCall("POST", "/signal", map[string]any{"kekkai": kek, "type": "slack.message", "key": key,
 		"data": map[string]any{"text": q[0].Text, "ts": q[0].TS, "history": "", "thread_contracts": a.threadContracts(key)}}, &sig)
 	if err != nil {
 		return err
@@ -736,6 +759,9 @@ func (a *adapter) route(ctx context.Context, key string) error {
 		a.record(e)
 		a.pop(key, 1)
 		return a.save()
+	}
+	if kek != a.chatKekkai {
+		return nil // another kekkai's run owns the thread but is not listening yet: the queue waits for the next tick
 	}
 	var runs []struct {
 		ID       string `json:"id"`
