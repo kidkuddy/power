@@ -57,6 +57,18 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 			switch evt.Type {
 			case socketmode.EventTypeConnected:
 				log.Printf("power: connected to Slack")
+			case socketmode.EventTypeConnecting:
+				if c, ok := evt.Data.(*slack.ConnectingEvent); ok {
+					log.Printf("power: connecting to Slack (attempt %d)", c.Attempt)
+				}
+			case socketmode.EventTypeConnectionError:
+				if c, ok := evt.Data.(*slack.ConnectionErrorEvent); ok {
+					log.Printf("power: Slack connection error (attempt %d, retry in %v): %v", c.Attempt, c.Backoff, c.ErrorObj)
+				}
+			case socketmode.EventTypeDisconnect:
+				if evt.Request != nil {
+					log.Printf("power: Slack disconnects: %s", evt.Request.Reason)
+				}
 			case socketmode.EventTypeEventsAPI:
 				ev, ok := evt.Data.(slackevents.EventsAPIEvent)
 				if !ok || evt.Request == nil {
