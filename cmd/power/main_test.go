@@ -919,13 +919,16 @@ func TestRunThreads(t *testing.T) {
 		t.Fatalf("ambiguous: resolves %v started %v", k.resolves, k.started)
 	}
 
-	// follow-ups land in the run thread, not under the contract message
+	// a cancelled contract says so on its own message, not in a post of its own
+	c2, n := a.st.Threads["c2"].TS, len(s.of("chat.postMessage"))
 	k.mu.Lock()
 	k.events = append(k.events, ev(15, "contract.cancelled", "rc", map[string]any{"id": "c2"}))
 	k.mu.Unlock()
 	must(a.events(ctx))
-	if l := last(); l.Get("thread_ts") != "700.1" || !strings.Contains(l.Get("text"), "Cancelled") {
-		t.Fatalf("follow-up = %v", l)
+	ups = s.of("chat.update")
+	if u := ups[len(ups)-1]; len(s.of("chat.postMessage")) != n || u.Get("ts") != c2 || !strings.Contains(u.Get("blocks"), "*Name?*") ||
+		!strings.Contains(u.Get("blocks"), "cancelled: the run moved on") {
+		t.Fatalf("cancelled: posts %d→%d, update %v", n, len(s.of("chat.postMessage")), u)
 	}
 
 	// a card read back from the state file (children omitted while empty) still takes a child line
@@ -936,7 +939,7 @@ func TestRunThreads(t *testing.T) {
 		kami.Event{Run: "rz", Type: "run.started"}, "late", "↳ POWER started late"))
 
 	// an AFK answer in rp's tree goes on rp's card, not into a message of its own
-	n := len(s.of("chat.postMessage"))
+	n = len(s.of("chat.postMessage"))
 	k.mu.Lock()
 	k.events = append(k.events, ev(16, "contract.resolved", "rp", map[string]any{"id": "c3", "by": "resolver", "answer": "good\nbecause"}))
 	k.mu.Unlock()

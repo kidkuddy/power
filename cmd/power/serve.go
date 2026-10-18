@@ -357,7 +357,9 @@ func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
 		if !t.Mine {
 			by, _ := ev.Data["by"].(string)
 			ans, _ := ev.Data["answer"].(string)
-			a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by %s", ans, by))
+			if t.Buttons {
+				a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by %s", ans, by))
+			}
 			done, err := a.afkOnCard(ctx, t, by, ans)
 			if err != nil {
 				return err
@@ -369,11 +371,8 @@ func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
 			}
 		}
 		delete(a.st.Threads, id)
-	case "contract.cancelled":
-		a.settle(ctx, id, t, "cancelled")
-		if _, _, err := a.post(ctx, t.note("followup", id, "✗ Cancelled, the run moved on without you. Nothing to do."), nil); err != nil {
-			return err
-		}
+	case "contract.cancelled": // said on the message itself: a follow-up of its own was one more post per contract
+		a.settle(ctx, id, t, "✗ cancelled: the run moved on without you. Nothing to do.")
 		delete(a.st.Threads, id)
 	case "contract.resolver_failed":
 		why, _ := ev.Data["error"].(string)
@@ -386,14 +385,11 @@ func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
 	return nil
 }
 
-// settle redraws a button message without its buttons, so it reads as a
-// record rather than a live question. Best-effort: the answer already landed.
+// settle redraws a contract message without its buttons, with line under it, so
+// it reads as a record rather than a live question. Best-effort: the answer already landed.
 // The fallback text is the line alone: the blocks carry the contract, and
 // chat.update refuses a long sealed text (msg_too_long).
 func (a *adapter) settle(ctx context.Context, id string, t *thread, line string) {
-	if !t.Buttons {
-		return
-	}
 	im, err := a.dm(ctx)
 	var text string
 	var blocks []slack.Block
@@ -727,7 +723,7 @@ func (a *adapter) route(ctx context.Context, key string) error {
 		if r.Workflow == a.chatWorkflow {
 			// parked on its own question (start? wrap up? post?): the owner moved on, so answer
 			// "don't", and the message gets through next tick
-			return a.supersede(r.ID)
+			return a.supersede(ctx, r.ID)
 		}
 	}
 	var texts []string
@@ -828,7 +824,7 @@ var chatDont = map[string]string{"confirm": "cancel", "confirm_wrap": "keep_goin
 
 // supersede answers a chat run's parked question with "don't" when the owner
 // writes instead of tapping; a chat run that is busy thinking has none.
-func (a *adapter) supersede(runID string) error {
+func (a *adapter) supersede(ctx context.Context, runID string) error {
 	var open []kami.ContractView
 	if err := a.kamiCall("GET", "/contracts?"+url.Values{"status": {"open"}, "run": {runID}}.Encode(), nil, &open); err != nil {
 		return err
@@ -843,6 +839,10 @@ func (a *adapter) supersede(runID string) error {
 		var ke *kamiErr
 		if err != nil && !errors.As(err, &ke) {
 			return err
+		}
+		if t := a.st.Threads[c.ID]; t != nil && err == nil { // the question says it moved on; no follow-up of its own
+			t.Mine = true
+			a.settle(ctx, c.ID, t, "✗ moved on: you wrote a new message instead.")
 		}
 	}
 	return nil
@@ -939,7 +939,9 @@ func (a *adapter) resolve(ctx context.Context, id string, t *thread, answer stri
 	if out.Resolution != nil {
 		answer = out.Resolution.Answer
 	}
-	a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by <@%s>", answer, a.owner))
+	if t.Buttons {
+		a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by <@%s>", answer, a.owner))
+	}
 	if inThread {
 		_, _, err = a.post(ctx, t.note("followup", id, "✓ Got it: "+answer+". POWER approves."), nil)
 	}
