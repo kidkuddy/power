@@ -428,6 +428,21 @@ func TestCanvasAndDM(t *testing.T) {
 	}
 }
 
+func TestCanvasMarkdown(t *testing.T) {
+	for in, want := range map[string]string{
+		"- a\n  1. b\n": "- a\n  - **1.** b\n", // the probe Slack refused at line 2
+		"- Shows: list:\n  1. Finish,\n     wrapped\n  2. Errors\n- Reuses: x": "- Shows: list:\n  - **1.** Finish,\n     wrapped\n  - **2.** Errors\n- Reuses: x",
+		"1. a\n2. b\n   1. c":    "1. a\n2. b\n   1. c", // numbered in numbered is fine
+		"- a\n\n1. b":            "- a\n\n1. b",         // a new list, not nested
+		"- a\n```\n  1. b\n```":  "- a\n```\n  1. b\n```",
+		"- a\n  1. b\n     1. c": "- a\n  - **1.** b\n     - **1.** c",
+	} {
+		if got := canvasMarkdown(in); got != want {
+			t.Errorf("canvasMarkdown(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestParseReply(t *testing.T) {
 	form := &kami.ContractView{Contract: &kami.Contract{Options: []string{"rated"},
 		Fields: map[string]string{"rating": "enum:good,bad", "replay": "bool", "note": "string?"}}}

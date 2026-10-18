@@ -491,7 +491,7 @@ func (a *adapter) canvas(ctx context.Context, key, title, markdown string, users
 }
 
 func (a *adapter) writeCanvas(ctx context.Context, key, title, markdown string, users []string) (string, error) {
-	doc := slack.DocumentContent{Type: "markdown", Markdown: markdown}
+	doc := slack.DocumentContent{Type: "markdown", Markdown: canvasMarkdown(markdown)}
 	var keyFile string
 	if key != "" {
 		if !slug.MatchString(key) {
@@ -522,6 +522,48 @@ func (a *adapter) writeCanvas(ctx context.Context, key, title, markdown string, 
 		}
 	}
 	return a.permalink(ctx, id)
+}
+
+var listItem = regexp.MustCompile(`^(\s*)([-*+]|\d+[.)])\s+`)
+
+// canvasMarkdown rewrites what canvases refuse: a numbered item under a bullet
+// ("Unsupported list type (numbered) within bullet list") becomes a bullet that
+// keeps its number in bold. Code fences are left as they are.
+func canvasMarkdown(md string) string {
+	type item struct {
+		indent int
+		bullet bool
+	}
+	var open []item // the list items this line may be nested under
+	fence := false
+	lines := strings.Split(md, "\n")
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		if strings.HasPrefix(t, "```") {
+			fence = !fence
+			continue
+		}
+		if fence || t == "" {
+			continue
+		}
+		m := listItem.FindStringSubmatch(l)
+		if m == nil {
+			if l[0] != ' ' && l[0] != '\t' {
+				open = nil // unindented text ends every list
+			}
+			continue
+		}
+		for len(open) > 0 && open[len(open)-1].indent >= len(m[1]) {
+			open = open[:len(open)-1]
+		}
+		bullet := strings.ContainsAny(m[2], "-*+")
+		if !bullet && len(open) > 0 && open[len(open)-1].bullet {
+			lines[i] = m[1] + "- **" + m[2] + "** " + l[len(m[0]):]
+			bullet = true
+		}
+		open = append(open, item{len(m[1]), bullet})
+	}
+	return strings.Join(lines, "\n")
 }
 
 // detailClient folds a failed call's `detail` into its `error`: slack-go keeps only the code
