@@ -120,8 +120,11 @@ func (a *adapter) events(ctx context.Context) error {
 		if ev.Error != "" {
 			return fmt.Errorf("kami events: %s", ev.Error)
 		}
-		// A failed post returns without advancing Since: the event is retried next poll.
-		if err := a.handle(ctx, ev.Event); err != nil {
+		// A failed post returns without advancing Since: the event is retried next poll,
+		// unless Slack refused it for good, when retrying would only hold up the events behind it.
+		if err := a.handle(ctx, ev.Event); permanent(err) {
+			log.Printf("power: event %d (%s) dropped: %v", ev.ID, ev.Type, err)
+		} else if err != nil {
 			a.logErr(a.save())
 			return err
 		}
@@ -225,6 +228,23 @@ func (a *adapter) tellChat(thread, text string) {
 func badThread(err error) bool {
 	var se slack.SlackErrorResponse
 	return errors.As(err, &se) && (se.Err == "invalid_thread_ts" || se.Err == "thread_not_found")
+}
+
+// permanent is Slack refusing the message itself: the same message is refused
+// every time. Network errors, rate limits and auth trouble pass, so they retry.
+func permanent(err error) bool {
+	var se slack.SlackErrorResponse
+	if !errors.As(err, &se) {
+		return false
+	}
+	code, _, _ := strings.Cut(se.Err, ":") // detailClient may append Slack's detail
+	switch code {
+	case "msg_too_long", "invalid_blocks", "invalid_blocks_format", "no_text", "invalid_arguments", "invalid_attachments",
+		"too_many_attachments", "channel_not_found", "not_in_channel", "is_archived", "message_not_found",
+		"cant_update_message", "edit_window_closed", "invalid_thread_ts", "thread_not_found", "restricted_action":
+		return true
+	}
+	return false
 }
 
 type link struct{ thread, workflow, parent, root string } // root: the top-level run's id

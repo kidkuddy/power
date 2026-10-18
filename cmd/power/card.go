@@ -105,11 +105,9 @@ func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev kami.
 	e := entry{Dir: "out", Kind: "card", Channel: a.im, TS: c.TS, ThreadTS: c.Thread, Text: t, RunID: rootID, Workflow: root.workflow}
 	if c.TS == "" {
 		_, ts, err := a.post(ctx, e, []slack.Block{section(t)})
-		if badThread(err) {
+		if err != nil { // the error entry is the record; a card never holds up the events behind it
+			a.logErr(fmt.Errorf("card %s: %w", rootID, err))
 			return nil
-		}
-		if err != nil {
-			return err
 		}
 		c.TS = ts
 	} else {
@@ -124,7 +122,8 @@ func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev kami.
 		if err != nil {
 			e.Kind, e.Error = "error", "card: "+err.Error()
 			a.record(e)
-			return err
+			a.logErr(fmt.Errorf("card %s: %w", rootID, err))
+			return nil
 		}
 		a.record(e)
 	}

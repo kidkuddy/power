@@ -184,8 +184,8 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "conversations.open":
 		out = map[string]any{"channel": map[string]any{"id": "D1"}}
 	case "chat.postMessage":
-		if r.Form.Get("thread_ts") == "999.9" {
-			out = map[string]any{"ok": false, "error": "invalid_thread_ts"}
+		if code := map[string]string{"999.9": "invalid_thread_ts", "998.9": "msg_too_long", "997.9": "internal_error"}[r.Form.Get("thread_ts")]; code != "" {
+			out = map[string]any{"ok": false, "error": code}
 			break
 		}
 		s.n++
@@ -932,6 +932,30 @@ func TestRunThreads(t *testing.T) {
 	ups = s.of("chat.update")
 	if len(s.of("chat.postMessage")) != n || !strings.Contains(ups[len(ups)-1].Get("text"), "• 🤖 AFK answered: good …") {
 		t.Fatalf("afk on card: posts %d→%d, last update %v", n, len(s.of("chat.postMessage")), ups[len(ups)-1])
+	}
+}
+
+func TestRefusedEventDoesNotBlock(t *testing.T) {
+	ctx := context.Background()
+	k, s, start := setup(t)
+	now := time.Now()
+	for _, th := range []string{"998.9", "997.9", "700.1"} {
+		k.runs["r"+th] = map[string]any{"workflow": "chat", "vars": map[string]any{"thread_ts": th}}
+	}
+	fin := func(id int64, run string) kami.Event {
+		return kami.Event{ID: id, TS: now, Type: "run.finished", Run: run, Data: map[string]any{"status": "done"}}
+	}
+	k.events = []kami.Event{fin(1, "r998.9"), fin(2, "r700.1")}
+	a := start()
+	if err := a.events(ctx); err != nil || a.st.Since != 2 || len(s.of("chat.postMessage")) != 2 {
+		t.Fatalf("msg_too_long held the cursor: %v since %d posts %d", err, a.st.Since, len(s.of("chat.postMessage")))
+	}
+	// a refusal that may pass (internal_error) keeps the event for the next poll
+	k.mu.Lock()
+	k.events = append(k.events, fin(3, "r997.9"), fin(4, "r700.1"))
+	k.mu.Unlock()
+	if err := a.events(ctx); err == nil || a.st.Since != 2 {
+		t.Fatalf("internal_error dropped the event: %v since %d", err, a.st.Since)
 	}
 }
 
