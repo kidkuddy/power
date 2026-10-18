@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/slack-go/slack"
 
@@ -24,21 +25,45 @@ type card struct {
 	Children map[string]int `json:"children,omitempty"` // child run id -> its line
 }
 
-// ponytail: keeps the last 30 lines; a 3000-char section fits that comfortably.
-const cardLines = 30
+// ponytail: keeps at most the last 30 lines, fewer when they do not fit the message.
+const (
+	cardLines = 30
+	cardLine  = 200 // runes: a milestone can carry a whole report
+)
 
-func (c *card) text() string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "*POWER's status card* · %s · *%s*\n", c.Title, c.Status)
-	lines := c.Lines
-	if len(lines) > cardLines {
-		lines = append([]string{"…"}, lines[len(lines)-cardLines:]...)
+// text is the card within limit, as size measures it: each line cut to cardLine
+// runes, a run of identical lines shown once with ×n, the oldest dropped until it fits.
+func (c *card) text(limit int, size func(string) int) string {
+	var lines []string
+	n := 0
+	for i, l := range c.Lines {
+		if n++; i+1 < len(c.Lines) && c.Lines[i+1] == l {
+			continue
+		}
+		if r := []rune(l); len(r) > cardLine {
+			l = string(r[:cardLine-1]) + "…"
+		}
+		if n > 1 {
+			l += fmt.Sprintf(" ×%d", n)
+		}
+		lines, n = append(lines, l), 0
 	}
-	for _, l := range lines {
-		b.WriteString("• " + l + "\n")
+	head := fmt.Sprintf("*POWER's status card* · %s · *%s*\n", c.Title, c.Status)
+	foot := fmt.Sprintf("_updated %s_", time.Now().Format("15:04"))
+	for drop := max(0, len(lines)-cardLines); ; drop++ {
+		var b strings.Builder
+		b.WriteString(head)
+		if drop > 0 {
+			b.WriteString("• …\n")
+		}
+		for _, l := range lines[drop:] {
+			b.WriteString("• " + l + "\n")
+		}
+		b.WriteString(foot)
+		if size(b.String()) <= limit || drop == len(lines) {
+			return b.String()
+		}
 	}
-	fmt.Fprintf(&b, "_updated %s_", time.Now().Format("15:04"))
-	return b.String()
 }
 
 // onCard records one milestone of the run tree rooted at rootID on its card,
@@ -72,7 +97,11 @@ func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev kami.
 			c.Lines = append(c.Lines, line)
 		}
 	}
-	t := c.text()
+	limit, size := 3000, utf8.RuneCountInString // a section's text
+	if a.e2e != nil && a.isSealed(c.Thread) {
+		limit, size = sealedMax(a.sealedForm(c.Thread)), func(s string) int { return len(s) }
+	}
+	t := c.text(limit, size)
 	e := entry{Dir: "out", Kind: "card", Channel: a.im, TS: c.TS, ThreadTS: c.Thread, Text: t, RunID: rootID, Workflow: root.workflow}
 	if c.TS == "" {
 		_, ts, err := a.post(ctx, e, []slack.Block{section(t)})

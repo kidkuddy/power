@@ -156,6 +156,25 @@ var e2eKanaIdx = func() map[rune]byte {
 
 const e2eMin = 1 + 16 + 4 + 16 // the shortest sealed text: a pair message from POWER with no text
 
+// e2eOver is what e2eSeal adds to the text for POWER's two recipients (the owner and itself):
+// pre, a slot each (iv | K | SHA-256(body) | tag), the body's iv and tag.
+const e2eOver = 32 + 32 + 1 + 2*(12+32+sha256.Size+16) + 12 + 16
+
+// sealedMax is the most plaintext bytes a message edited in a sealed thread of form can hold.
+// chat.update refuses text over about 4000 bytes (msg_too_long; the longest a card got through
+// was 1332 kana) and blocks over 3000 characters (invalid_blocks). Kana is 3 bytes a byte;
+// the old form is base64 behind its prefix.
+func sealedMax(form string) int {
+	const update, block = 1332 * 3, 3000
+	switch form {
+	case "pair":
+		return update/3 - e2eMin
+	case "kana":
+		return update/3 - e2eOver
+	}
+	return (block-len(e2ePrefix))/4*3 - e2eOver
+}
+
 func toKana(b []byte) string {
 	r := make([]rune, len(b))
 	for i, c := range b {

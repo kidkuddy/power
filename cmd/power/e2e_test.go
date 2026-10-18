@@ -7,10 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/slack-go/slack"
 
@@ -411,5 +413,46 @@ func TestSectionAlwaysExpanded(t *testing.T) {
 	b, _ := json.Marshal(section("long card text"))
 	if !strings.Contains(string(b), `"expand":true`) {
 		t.Fatalf("section would be cut by Slack: %s", b)
+	}
+}
+
+func TestCardBudget(t *testing.T) {
+	ctx := context.Background()
+	_, s, start := setup(t)
+	a := start()
+	ownerKey, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	if _, err := e2eSetup(a.dir, base64.StdEncoding.EncodeToString(ownerKey.PublicKey().Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if a.e2e, err = loadSealer(a.dir); err != nil {
+		t.Fatal(err)
+	}
+	report := strings.Repeat("a whole report ", 40)
+	for i, form := range []string{"plain", "pair", "kana", ""} {
+		thread := fmt.Sprintf("50%d.1", i)
+		if form != "plain" {
+			a.markSealed(thread, form)
+		}
+		root := link{thread: thread, workflow: "goal", root: "g" + thread}
+		for n := range 40 {
+			text := fmt.Sprintf("%d %s", n, report)
+			if n >= 35 {
+				text = "🗂 filing!"
+			}
+			if err := a.onCard(ctx, root.root, root, kami.Event{Run: root.root, Type: "run.say"}, "goal", text); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ups := s.of("chat.update")
+		sent := ups[len(ups)-1].Get("text")
+		plain, ok := a.unseal(sent, "bot")
+		if !ok || utf8.RuneCountInString(sent) > 3000 || len(sent) > 3996 || (form != "plain") != (plain != sent) {
+			t.Fatalf("%q: %d runes, %d bytes sent (sealed %v)", form, utf8.RuneCountInString(sent), len(sent), plain != sent)
+		}
+		if !strings.HasPrefix(plain, "*POWER's status card*") || !strings.Contains(plain, "• …\n") || !strings.Contains(plain, "• 🗂 filing! ×5\n") ||
+			!strings.Contains(plain, "• 34 a whole report") || strings.Contains(plain, report) || len(a.st.Cards[root.root].Lines) != 40 {
+			t.Fatalf("%q card:\n%s", form, plain)
+		}
 	}
 }
