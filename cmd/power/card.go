@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -69,9 +71,10 @@ func (c *card) text(limit int, size func(string) int) string {
 // onCard records one milestone of the run tree rooted at rootID on its card,
 // posting and pinning the card on the first one.
 func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev kami.Event, workflow, text string) error {
-	c := a.st.Cards[rootID]
-	if c == nil {
-		c = &card{Thread: root.thread, Title: fmt.Sprintf("%s `%s`", root.workflow, rootID), Status: "running"}
+	c := &card{Thread: root.thread, Title: fmt.Sprintf("%s `%s`", root.workflow, rootID), Status: "running"}
+	if old := a.st.Cards[rootID]; old != nil { // a copy: the stored card changes only once Slack has the new one
+		*c = *old
+		c.Lines, c.Children = slices.Clone(old.Lines), maps.Clone(old.Children)
 	}
 	if c.Children == nil { // omitted from the state file while it was empty
 		c.Children = map[string]int{}
