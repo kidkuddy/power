@@ -345,7 +345,8 @@ func TestServe(t *testing.T) {
 	must(a.onAction(ctx, tap(owner, "c1", "keep")))
 	up := s.of("chat.update")
 	if len(k.resolves) != 1 || k.resolves[0] != "c1=keep map[]" || len(up) != 1 || up[0].Get("ts") != "100.1" ||
-		strings.Contains(up[0].Get("blocks"), "action_id") || !strings.Contains(up[0].Get("blocks"), "answered *keep* by \\u003c@UOWNER\\u003e") {
+		strings.Contains(up[0].Get("blocks"), "action_id") || !strings.Contains(up[0].Get("blocks"), "answered *keep* by \\u003c@UOWNER\\u003e") ||
+		strings.Contains(up[0].Get("text"), "Keep the draft?") {
 		t.Fatalf("tap: resolves %v update %v", k.resolves, up)
 	}
 
@@ -376,6 +377,17 @@ func TestServe(t *testing.T) {
 	if p := s.of("chat.postMessage"); len(p) != before+1 || p[before].Get("thread_ts") != "100.3" ||
 		!strings.Contains(p[before].Get("text"), "resolver already answered: 8080") || len(a.st.Threads) != 0 {
 		t.Fatalf("follow-ups = %v threads %v", p[before:], a.st.Threads)
+	}
+
+	// a tap on a contract POWER no longer tracks: the message loses its buttons, with a note
+	cb := tap(owner, "c1", "keep")
+	cb.Message.Timestamp = "100.1"
+	cb.Message.Blocks = slack.Blocks{BlockSet: contractBlocks("Keep the draft?", "c1", []string{"keep"}, "", true)}
+	must(a.onAction(ctx, cb))
+	up = s.of("chat.update")
+	if u := up[len(up)-1]; u.Get("ts") != "100.1" || strings.Contains(u.Get("blocks"), "action_id") ||
+		!strings.Contains(u.Get("blocks"), "Keep the draft?") || !strings.Contains(u.Get("blocks"), "already settled") {
+		t.Fatalf("unknown tap redraw = %v", u)
 	}
 }
 

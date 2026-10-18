@@ -388,6 +388,8 @@ func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
 
 // settle redraws a button message without its buttons, so it reads as a
 // record rather than a live question. Best-effort: the answer already landed.
+// The fallback text is the line alone: the blocks carry the contract, and
+// chat.update refuses a long sealed text (msg_too_long).
 func (a *adapter) settle(ctx context.Context, id string, t *thread, line string) {
 	if !t.Buttons {
 		return
@@ -396,7 +398,7 @@ func (a *adapter) settle(ctx context.Context, id string, t *thread, line string)
 	var text string
 	var blocks []slack.Block
 	if err == nil {
-		text, blocks, _, err = a.sealOut(ctx, im, t.Thread, t.Text,
+		text, blocks, _, err = a.sealOut(ctx, im, t.Thread, line,
 			[]slack.Block{section(t.Text), slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, line, false, false))})
 	}
 	if err == nil {
@@ -408,6 +410,36 @@ func (a *adapter) settle(ctx context.Context, id string, t *thread, line string)
 		e.ThreadTS, e.TS, e.Error = "", t.TS, "redraw: "+err.Error()
 		a.record(e)
 	}
+}
+
+// unsettled redraws a tapped message whose contract POWER no longer tracks (settled
+// while its redraw failed) without its buttons: a tap cannot land there any more.
+// The blocks Slack sent back are kept as they are, sealed or not; only the note is new.
+func (a *adapter) unsettled(ctx context.Context, cb slack.InteractionCallback) error {
+	const note = "already settled: nothing to answer here any more"
+	var keep []slack.Block
+	set := cb.Message.Blocks.BlockSet
+	for i, b := range set {
+		if _, ok := b.(*slack.ActionBlock); ok {
+			continue
+		}
+		if _, legend := b.(*slack.ContextBlock); legend && i > 0 { // a sealed thread's buttons: their legend follows them
+			if _, ok := set[i-1].(*slack.ActionBlock); ok {
+				continue
+			}
+		}
+		keep = append(keep, b)
+	}
+	text, blocks, _, err := a.sealOut(ctx, cb.Channel.ID, cb.Message.ThreadTimestamp, note,
+		[]slack.Block{slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, note, false, false))})
+	if err == nil {
+		_, _, _, err = a.api.UpdateMessageContext(ctx, cb.Channel.ID, cb.Message.Timestamp, slack.MsgOptionText(text, false),
+			slack.MsgOptionBlocks(append(keep, blocks...)...))
+	}
+	if err != nil {
+		a.record(entry{Dir: "out", Kind: "error", Channel: cb.Channel.ID, TS: cb.Message.Timestamp, Text: note, Error: "redraw: " + err.Error()})
+	}
+	return err
 }
 
 // note is an outbound entry in a contract's thread: its run's thread, or for
@@ -466,6 +498,7 @@ func (a *adapter) onAction(ctx context.Context, cb slack.InteractionCallback) er
 			log.Printf("power: tap on unknown contract %s", id)
 			e.Error = "unknown contract"
 			a.record(e)
+			a.logErr(a.unsettled(ctx, cb))
 			continue
 		}
 		e.TS, e.RunID, e.Workflow = t.TS, t.RunID, t.Workflow
