@@ -57,6 +57,18 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 			switch evt.Type {
 			case socketmode.EventTypeConnected:
 				log.Printf("power: connected to Slack")
+			case socketmode.EventTypeConnecting:
+				if c, ok := evt.Data.(*slack.ConnectingEvent); ok {
+					log.Printf("power: connecting to Slack (attempt %d)", c.Attempt)
+				}
+			case socketmode.EventTypeConnectionError:
+				if c, ok := evt.Data.(*slack.ConnectionErrorEvent); ok {
+					log.Printf("power: Slack connection error (attempt %d, retry in %v): %v", c.Attempt, c.Backoff, c.ErrorObj)
+				}
+			case socketmode.EventTypeDisconnect:
+				if evt.Request != nil {
+					log.Printf("power: Slack disconnects: %s", evt.Request.Reason)
+				}
 			case socketmode.EventTypeEventsAPI:
 				ev, ok := evt.Data.(slackevents.EventsAPIEvent)
 				if !ok || evt.Request == nil {
@@ -120,8 +132,11 @@ func (a *adapter) events(ctx context.Context) error {
 		if ev.Error != "" {
 			return fmt.Errorf("kami events: %s", ev.Error)
 		}
-		// A failed post returns without advancing Since: the event is retried next poll.
-		if err := a.handle(ctx, ev.Event); err != nil {
+		// A failed post returns without advancing Since: the event is retried next poll,
+		// unless Slack refused it for good, when retrying would only hold up the events behind it.
+		if err := a.handle(ctx, ev.Event); permanent(err) {
+			log.Printf("power: event %d (%s) dropped: %v", ev.ID, ev.Type, err)
+		} else if err != nil {
 			a.logErr(a.save())
 			return err
 		}
@@ -200,14 +215,28 @@ func (a *adapter) milestone(ctx context.Context, ev kami.Event) error {
 			}
 		}
 	}
-	_, _, err = a.post(ctx, entry{Kind: "milestone", ThreadTS: l.thread, Text: text, RunID: ev.Run, Workflow: l.workflow}, nil)
+	_, ts, err := a.post(ctx, entry{Kind: "milestone", ThreadTS: l.thread, Text: text, RunID: ev.Run, Workflow: l.workflow}, nil)
 	if badThread(err) {
 		return nil // a thread_ts that is not a thread of the owner DM: the error entry is the record
+	}
+	if err == nil && ev.Type == "run.finished" && l.parent == "" && l.workflow == a.chatWorkflow && ev.Data["status"] == kami.StDone {
+		a.asleep(ctx, l.thread, ts)
 	}
 	if err == nil && ev.Type == "run.finished" && l.parent == "" && l.workflow != a.chatWorkflow {
 		a.tellChat(l.thread, "[kami] "+strings.TrimPrefix(strings.TrimPrefix(text, "✅ "), "❌ ")+" (run "+ev.Run+")")
 	}
 	return err
+}
+
+// asleep keeps one note of a chat going to sleep per thread, the newest: the
+// chat sleeps after every answer, and each note was one more post (13 in a thread).
+func (a *adapter) asleep(ctx context.Context, thread, ts string) {
+	if old := a.st.Asleep[thread]; old != "" {
+		if _, _, err := a.api.DeleteMessageContext(ctx, a.im, old); err != nil {
+			log.Printf("power: delete old asleep note %s: %v", old, err)
+		}
+	}
+	a.st.Asleep[thread] = ts
 }
 
 // tellChat signals the chat run listening on a thread, if any: a top-level run
@@ -225,6 +254,23 @@ func (a *adapter) tellChat(thread, text string) {
 func badThread(err error) bool {
 	var se slack.SlackErrorResponse
 	return errors.As(err, &se) && (se.Err == "invalid_thread_ts" || se.Err == "thread_not_found")
+}
+
+// permanent is Slack refusing the message itself: the same message is refused
+// every time. Network errors, rate limits and auth trouble pass, so they retry.
+func permanent(err error) bool {
+	var se slack.SlackErrorResponse
+	if !errors.As(err, &se) {
+		return false
+	}
+	code, _, _ := strings.Cut(se.Err, ":") // detailClient may append Slack's detail
+	switch code {
+	case "msg_too_long", "invalid_blocks", "invalid_blocks_format", "no_text", "invalid_arguments", "invalid_attachments",
+		"too_many_attachments", "channel_not_found", "not_in_channel", "is_archived", "message_not_found",
+		"cant_update_message", "edit_window_closed", "invalid_thread_ts", "thread_not_found", "restricted_action":
+		return true
+	}
+	return false
 }
 
 type link struct{ thread, workflow, parent, root string } // root: the top-level run's id
@@ -337,7 +383,9 @@ func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
 		if !t.Mine {
 			by, _ := ev.Data["by"].(string)
 			ans, _ := ev.Data["answer"].(string)
-			a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by %s", ans, by))
+			if t.Buttons {
+				a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by %s", ans, by))
+			}
 			done, err := a.afkOnCard(ctx, t, by, ans)
 			if err != nil {
 				return err
@@ -349,11 +397,8 @@ func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
 			}
 		}
 		delete(a.st.Threads, id)
-	case "contract.cancelled":
-		a.settle(ctx, id, t, "cancelled")
-		if _, _, err := a.post(ctx, t.note("followup", id, "✗ Cancelled, the run moved on without you. Nothing to do."), nil); err != nil {
-			return err
-		}
+	case "contract.cancelled": // said on the message itself: a follow-up of its own was one more post per contract
+		a.settle(ctx, id, t, "✗ cancelled: the run moved on without you. Nothing to do.")
 		delete(a.st.Threads, id)
 	case "contract.resolver_failed":
 		why, _ := ev.Data["error"].(string)
@@ -366,17 +411,16 @@ func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
 	return nil
 }
 
-// settle redraws a button message without its buttons, so it reads as a
-// record rather than a live question. Best-effort: the answer already landed.
+// settle redraws a contract message without its buttons, with line under it, so
+// it reads as a record rather than a live question. Best-effort: the answer already landed.
+// The fallback text is the line alone: the blocks carry the contract, and
+// chat.update refuses a long sealed text (msg_too_long).
 func (a *adapter) settle(ctx context.Context, id string, t *thread, line string) {
-	if !t.Buttons {
-		return
-	}
 	im, err := a.dm(ctx)
 	var text string
 	var blocks []slack.Block
 	if err == nil {
-		text, blocks, _, err = a.sealOut(ctx, im, t.Thread, t.Text,
+		text, blocks, _, err = a.sealOut(ctx, im, t.Thread, line,
 			[]slack.Block{section(t.Text), slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, line, false, false))})
 	}
 	if err == nil {
@@ -388,6 +432,36 @@ func (a *adapter) settle(ctx context.Context, id string, t *thread, line string)
 		e.ThreadTS, e.TS, e.Error = "", t.TS, "redraw: "+err.Error()
 		a.record(e)
 	}
+}
+
+// unsettled redraws a tapped message whose contract POWER no longer tracks (settled
+// while its redraw failed) without its buttons: a tap cannot land there any more.
+// The blocks Slack sent back are kept as they are, sealed or not; only the note is new.
+func (a *adapter) unsettled(ctx context.Context, cb slack.InteractionCallback) error {
+	const note = "already settled: nothing to answer here any more"
+	var keep []slack.Block
+	set := cb.Message.Blocks.BlockSet
+	for i, b := range set {
+		if _, ok := b.(*slack.ActionBlock); ok {
+			continue
+		}
+		if _, legend := b.(*slack.ContextBlock); legend && i > 0 { // a sealed thread's buttons: their legend follows them
+			if _, ok := set[i-1].(*slack.ActionBlock); ok {
+				continue
+			}
+		}
+		keep = append(keep, b)
+	}
+	text, blocks, _, err := a.sealOut(ctx, cb.Channel.ID, cb.Message.ThreadTimestamp, note,
+		[]slack.Block{slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, note, false, false))})
+	if err == nil {
+		_, _, _, err = a.api.UpdateMessageContext(ctx, cb.Channel.ID, cb.Message.Timestamp, slack.MsgOptionText(text, false),
+			slack.MsgOptionBlocks(append(keep, blocks...)...))
+	}
+	if err != nil {
+		a.record(entry{Dir: "out", Kind: "error", Channel: cb.Channel.ID, TS: cb.Message.Timestamp, Text: note, Error: "redraw: " + err.Error()})
+	}
+	return err
 }
 
 // note is an outbound entry in a contract's thread: its run's thread, or for
@@ -431,6 +505,9 @@ func (a *adapter) onAction(ctx context.Context, cb slack.InteractionCallback) er
 		}
 		id, _, _ := strings.Cut(rest, ":")
 		val, readable := a.unseal(act.Value, "bot") // a sealed thread's buttons carry values POWER sealed
+		if readable && val != act.Value {
+			val = buttonValue(val)
+		}
 		e := entry{Dir: "in", Kind: "button", Channel: cb.Channel.ID, TS: cb.Message.Timestamp, User: cb.User.ID,
 			Text: val, Value: val, ContractID: id}
 		if !readable {
@@ -443,6 +520,7 @@ func (a *adapter) onAction(ctx context.Context, cb slack.InteractionCallback) er
 			log.Printf("power: tap on unknown contract %s", id)
 			e.Error = "unknown contract"
 			a.record(e)
+			a.logErr(a.unsettled(ctx, cb))
 			continue
 		}
 		e.TS, e.RunID, e.Workflow = t.TS, t.RunID, t.Workflow
@@ -514,7 +592,10 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 		return nil
 	}
 	inThread := m.ThreadTimeStamp != "" && m.ThreadTimeStamp != m.TimeStamp
-	plain, readable := a.unseal(m.Text, "owner")
+	plain, form, sealedAt, readable := a.unsealForm(m.Text, "owner")
+	if ts, err := strconv.ParseFloat(m.TimeStamp, 64); readable && !sealedAt.IsZero() && err == nil && ts-float64(sealedAt.Unix()) > 600 {
+		readable = false // sealed well before Slack says it was sent: an old message of the owner's posted again
+	}
 	in := entry{Dir: "in", Kind: "dm", Channel: m.Channel, TS: m.TimeStamp, ThreadTS: m.ThreadTimeStamp, User: m.User, Text: plain}
 	if inThread {
 		in.Kind = "thread_reply"
@@ -528,14 +609,19 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 	if inThread {
 		sealKey = m.ThreadTimeStamp
 	}
-	if !readable { // e2e3 POWER cannot open: wrong key, not from the owner's key, or tampered
+	// the forms without a sealed time are only taken in threads already sealed in them: otherwise Slack could
+	// repost an old e2e3 message as a new conversation, or into a pair thread, past the replay check
+	if readable && plain != m.Text && form != "pair" && (!a.isSealed(sealKey) || a.sealedForm(sealKey) == "pair") {
+		readable = false
+	}
+	if !readable { // e2e3 POWER cannot open: wrong key, not from the owner's key, tampered, or replayed
 		in.Error = "e2e3: unreadable"
 		a.record(in)
 		_, _, err := a.post(ctx, entry{Kind: "error", ThreadTS: sealKey, Text: "🔒 POWER could not decrypt that message (wrong key, or not from your key).", Error: in.Error}, nil)
 		return err
 	}
 	if plain != m.Text { // the owner wrote sealed: this thread stays sealed both ways
-		if err := a.markSealed(sealKey); err != nil {
+		if err := a.markSealed(sealKey, form); err != nil {
 			return err
 		}
 	}
@@ -663,7 +749,7 @@ func (a *adapter) route(ctx context.Context, key string) error {
 		if r.Workflow == a.chatWorkflow {
 			// parked on its own question (start? wrap up? post?): the owner moved on, so answer
 			// "don't", and the message gets through next tick
-			return a.supersede(r.ID)
+			return a.supersede(ctx, r.ID)
 		}
 	}
 	var texts []string
@@ -764,7 +850,7 @@ var chatDont = map[string]string{"confirm": "cancel", "confirm_wrap": "keep_goin
 
 // supersede answers a chat run's parked question with "don't" when the owner
 // writes instead of tapping; a chat run that is busy thinking has none.
-func (a *adapter) supersede(runID string) error {
+func (a *adapter) supersede(ctx context.Context, runID string) error {
 	var open []kami.ContractView
 	if err := a.kamiCall("GET", "/contracts?"+url.Values{"status": {"open"}, "run": {runID}}.Encode(), nil, &open); err != nil {
 		return err
@@ -779,6 +865,10 @@ func (a *adapter) supersede(runID string) error {
 		var ke *kamiErr
 		if err != nil && !errors.As(err, &ke) {
 			return err
+		}
+		if t := a.st.Threads[c.ID]; t != nil && err == nil { // the question says it moved on; no follow-up of its own
+			t.Mine = true
+			a.settle(ctx, c.ID, t, "✗ moved on: you wrote a new message instead.")
 		}
 	}
 	return nil
@@ -875,7 +965,9 @@ func (a *adapter) resolve(ctx context.Context, id string, t *thread, answer stri
 	if out.Resolution != nil {
 		answer = out.Resolution.Answer
 	}
-	a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by <@%s>", answer, a.owner))
+	if t.Buttons {
+		a.settle(ctx, id, t, fmt.Sprintf("answered *%s* by <@%s>", answer, a.owner))
+	}
 	if inThread {
 		_, _, err = a.post(ctx, t.note("followup", id, "✓ Got it: "+answer+". POWER approves."), nil)
 	}
@@ -984,8 +1076,10 @@ func render(c *kami.ContractView) string {
 	return b.String()
 }
 
+// section is card text, always shown in full: without expand Slack cuts long text to "Show more"
 func section(text string) slack.Block {
-	return slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil)
+	return slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil,
+		slack.SectionBlockOptionExpand(true))
 }
 
 // contractBlocks is the text plus, for a choice-like contract, one button per

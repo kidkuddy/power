@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/slack-go/slack"
 )
@@ -125,9 +127,79 @@ func decodePub(s string) (*ecdh.PublicKey, error) {
 
 // --- format (e2e3, see crypto.mjs) -------------------------------------------
 //
-// "e2e3:" + base64( pre | n × slot | body ), pre = spub | eph | n,
+// kana( pre | n × slot | body ), pre = spub | eph | n,
 // body = AES-GCM_K(text, AAD pre), slot = AES-GCM_W(K || SHA-256(body), AAD pre).
 // A slot pins its body, so a co-recipient who knows K cannot swap the body.
+// kana writes one byte as one character of e2eKana, with no prefix, so the text reads
+// as Japanese; the old "e2e3:" + base64 text still opens.
+
+// e2eKana is crypto.mjs's KANA: hiragana U+3041..3096, katakana U+30A1..30FA, the 80
+// first-grade kanji. Each survives Unicode NFC/NFKC, so Slack cannot rewrite it.
+var e2eKana = func() []rune {
+	var k []rune
+	for r := rune(0x3041); r <= 0x3096; r++ {
+		k = append(k, r)
+	}
+	for r := rune(0x30a1); r <= 0x30fa; r++ {
+		k = append(k, r)
+	}
+	return append(k, []rune("一右雨円王音下火花貝学気九休玉金空月犬見五口校左三山子四糸字耳七車手十出女小上森人水正生青夕石赤千川先早草足村大男竹中虫町天田土二日入年白八百文木本名目立力林六")...)
+}()
+
+var e2eKanaIdx = func() map[rune]byte {
+	m := make(map[rune]byte, len(e2eKana))
+	for i, r := range e2eKana {
+		m[r] = byte(i)
+	}
+	return m
+}()
+
+const e2eMin = 1 + 16 + 4 + 16 // the shortest sealed text: a pair message from POWER with no text
+
+// e2eOver is what e2eSeal adds to the text for POWER's two recipients (the owner and itself):
+// pre, a slot each (iv | K | SHA-256(body) | tag), the body's iv and tag.
+const e2eOver = 32 + 32 + 1 + 2*(12+32+sha256.Size+16) + 12 + 16
+
+// sealedMax is the most plaintext bytes a message edited in a sealed thread of form can hold.
+// chat.update refuses text over about 4000 bytes (msg_too_long; the longest a card got through
+// was 1332 kana) and blocks over 3000 characters (invalid_blocks). Kana is 3 bytes a byte;
+// the old form is base64 behind its prefix.
+func sealedMax(form string) int {
+	const update, block = 1332 * 3, 3000
+	switch form {
+	case "pair":
+		return update/3 - e2eMin
+	case "kana":
+		return update/3 - e2eOver
+	}
+	return (block-len(e2ePrefix))/4*3 - e2eOver
+}
+
+func toKana(b []byte) string {
+	r := make([]rune, len(b))
+	for i, c := range b {
+		r[i] = e2eKana[c]
+	}
+	return string(r)
+}
+
+// e2eDecode is the bytes of a sealed text, either form; ok is false for any other text.
+func e2eDecode(msg string) (_ []byte, ok bool) {
+	s := strings.Join(strings.Fields(msg), "")
+	if enc, ok := strings.CutPrefix(s, e2ePrefix); ok {
+		b, err := base64.StdEncoding.DecodeString(enc)
+		return b, err == nil
+	}
+	b := make([]byte, 0, len(s)/3)
+	for _, r := range s {
+		c, ok := e2eKanaIdx[r]
+		if !ok {
+			return nil, false
+		}
+		b = append(b, c)
+	}
+	return b, len(b) >= e2eMin
+}
 
 func wrapKey(ikm, spub, eph, rpub []byte) ([]byte, error) {
 	return hkdf.Key(sha256.New, ikm, concat(spub, eph, rpub), "e2e3 wrap", 32)
@@ -202,20 +274,87 @@ func e2eSeal(text string, sender *ecdh.PrivateKey, recipients ...*ecdh.PublicKey
 		}
 		out = concat(out, slot)
 	}
-	return e2ePrefix + base64.StdEncoding.EncodeToString(concat(out, body)), nil
+	return toKana(concat(out, body)), nil
+}
+
+// --- pair format (e2e4, see crypto.mjs) --------------------------------------
+//
+// b0 | nonce(16) | AES-256-GCM_K(time(4) | text, iv 0, AAD b0|nonce) | tag [| self(16)], b0 0xE1 from the
+// owner (who appends a self tag only the owner can check), 0xE2 from POWER. K = HKDF(X25519(owner, POWER),
+// salt nonce, info "e2e4 pair"|b0|ownerPub|powerPub). POWER is always the peer side here.
+
+const (
+	pairOwner = 0xe1
+	pairPeer  = 0xe2
+)
+
+func pairKey(me *ecdh.PrivateKey, other *ecdh.PublicKey, b0 byte, nonce, ownerRaw, peerRaw []byte) ([]byte, error) {
+	sh, err := me.ECDH(other)
+	if err != nil {
+		return nil, err
+	}
+	return hkdf.Key(sha256.New, sh, nonce, string(concat([]byte("e2e4 pair"), []byte{b0}, ownerRaw, peerRaw)), 32)
+}
+
+func pairGCM(key []byte) (cipher.AEAD, error) {
+	b, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(b)
+}
+
+// e2ePairSeal is POWER's text to the owner, in kana.
+func e2ePairSeal(text string, me *ecdh.PrivateKey, owner *ecdh.PublicKey, now time.Time) (string, error) {
+	nonce := make([]byte, 16)
+	rand.Read(nonce)
+	head := concat([]byte{pairPeer}, nonce)
+	k, err := pairKey(me, owner, pairPeer, nonce, owner.Bytes(), me.PublicKey().Bytes())
+	if err != nil {
+		return "", err
+	}
+	g, err := pairGCM(k)
+	if err != nil {
+		return "", err
+	}
+	t := make([]byte, 4)
+	binary.BigEndian.PutUint32(t, uint32(now.Unix()))
+	return toKana(g.Seal(head, make([]byte, 12), concat(t, []byte(text)), head)), nil
+}
+
+// e2ePairOpen opens a pair message to or from the owner. The owner's self tag is
+// not POWER's to check: it only lets the owner's Mac tell its own messages apart.
+func e2ePairOpen(b []byte, me *ecdh.PrivateKey, owner *ecdh.PublicKey) (text string, fromOwner bool, at time.Time, err error) {
+	fromOwner = b[0] == pairOwner
+	end := len(b)
+	if fromOwner {
+		end -= 16
+	}
+	if end < e2eMin {
+		return "", false, at, errors.New("e2e4: short")
+	}
+	k, err := pairKey(me, owner, b[0], b[1:17], owner.Bytes(), me.PublicKey().Bytes())
+	if err != nil {
+		return "", false, at, err
+	}
+	g, err := pairGCM(k)
+	if err != nil {
+		return "", false, at, err
+	}
+	pt, err := g.Open(nil, make([]byte, 12), b[17:end], b[:17])
+	if err != nil {
+		return "", false, at, errNotForUs
+	}
+	return string(pt[4:]), fromOwner, time.Unix(int64(binary.BigEndian.Uint32(pt)), 0), nil
 }
 
 var errNotForUs = errors.New("e2e3: not addressed to us or not from the expected key")
 
 // e2eOpen decrypts msg when it is addressed to me and was sealed by one of from.
 func e2eOpen(msg string, me *ecdh.PrivateKey, from ...*ecdh.PublicKey) (string, error) {
-	enc, ok := strings.CutPrefix(strings.TrimSpace(msg), e2ePrefix)
+	buf, ok := e2eDecode(msg)
 	if !ok {
-		return "", errors.New("e2e3: no prefix")
-	}
-	buf, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(enc), ""))
-	if err != nil {
-		return "", fmt.Errorf("e2e3: %v", err)
+		return "", errors.New("e2e3: not sealed text")
 	}
 	if len(buf) < 65 {
 		return "", errors.New("e2e3: short")
@@ -286,38 +425,87 @@ func (a *adapter) isSealed(ts string) bool {
 	return err == nil || !errors.Is(err, os.ErrNotExist)
 }
 
-func (a *adapter) markSealed(ts string) error {
+func (a *adapter) markSealed(ts, form string) error {
 	if !threadTS.MatchString(ts) {
 		return fmt.Errorf("e2e: bad thread ts %q", ts)
 	}
 	if err := os.MkdirAll(filepath.Dir(a.sealedPath(ts)), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(a.sealedPath(ts), nil, 0o600)
+	if _, err := os.Stat(a.sealedPath(ts)); err == nil {
+		return nil // a thread keeps the form it was sealed in
+	}
+	return os.WriteFile(a.sealedPath(ts), []byte(form), 0o600)
 }
 
-func sealedText(s string) bool { return strings.HasPrefix(strings.TrimSpace(s), e2ePrefix) }
+// sealedForm is the form a sealed thread speaks: "pair", "kana" (e2e3 bytes as kana) or
+// "" for the "e2e3:" + base64 of marks from before kana, so a conversation never changes form halfway.
+func (a *adapter) sealedForm(ts string) string {
+	b, _ := os.ReadFile(a.sealedPath(ts))
+	return string(b)
+}
+
+// asLegacy rewrites a kana ciphertext in the old "e2e3:" + base64 form: same bytes.
+func asLegacy(ct string) string {
+	b, _ := e2eDecode(ct)
+	return e2ePrefix + base64.StdEncoding.EncodeToString(b)
+}
+
+// sealedButton is the plaintext of a sealed button value.
+type sealedButton struct {
+	Label string `json:"label"`
+	Value string `json:"value"`
+}
+
+// buttonValue is the option value inside an opened button value. Values sealed
+// before labels rode along are the bare option value.
+// ponytail: an option value that itself starts with {"label": would be misread; none does
+func buttonValue(plain string) string {
+	var b sealedButton
+	if strings.HasPrefix(plain, `{"label":`) && json.Unmarshal([]byte(plain), &b) == nil {
+		return b.Value
+	}
+	return plain
+}
+
+func sealedText(s string) bool { _, ok := e2eDecode(s); return ok }
 
 // unseal is the plaintext of a message sealed by the key of who ("owner" or
 // "bot", POWER herself); any other text is returned as it is. ok is false for
 // e2e3 text POWER cannot read or that another key sealed: POWER's own sealed
 // reply posted under the owner's name is not the owner speaking.
 func (a *adapter) unseal(text, who string) (string, bool) {
-	if !sealedText(text) {
-		return text, true
+	plain, _, _, ok := a.unsealForm(text, who)
+	return plain, ok
+}
+
+// unsealForm is unseal plus the form text was sealed in and, for a pair message, when it was sealed.
+func (a *adapter) unsealForm(text, who string) (plain, form string, sealedAt time.Time, ok bool) {
+	b, sealed := e2eDecode(text)
+	if !sealed {
+		return text, "", time.Time{}, true
 	}
 	if a.e2e == nil {
-		return text, false
+		return text, "", time.Time{}, false
+	}
+	form = "kana"
+	if strings.HasPrefix(strings.TrimSpace(text), e2ePrefix) {
+		form = ""
+	} else if b[0] == pairOwner || b[0] == pairPeer {
+		if pt, fromOwner, at, err := e2ePairOpen(b, a.e2e.me, a.e2e.owner); err == nil {
+			return pt, "pair", at, fromOwner == (who == "owner")
+		}
+		// else an e2e3 header whose first byte looks like a pair one: tried below
 	}
 	from := a.e2e.me.PublicKey()
 	if who == "owner" {
 		from = a.e2e.owner
 	}
-	plain, err := e2eOpen(text, a.e2e.me, from)
+	pt, err := e2eOpen(text, a.e2e.me, from)
 	if err != nil {
-		return text, false
+		return text, form, time.Time{}, false
 	}
-	return plain, true
+	return pt, form, time.Time{}, true
 }
 
 // sealOut is what goes to Slack for a post or a redraw: in a sealed thread of
@@ -347,12 +535,20 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 	} else if channel != "" && channel != im {
 		return text, blocks, false, nil // the key is the owner DM's thread ts; another channel's thread is not sealed
 	}
+	form := a.sealedForm(key)
 	seal := func(s string) (string, error) {
 		if strings.TrimSpace(s) == "" {
 			return s, nil
 		}
 		// always sealed, even text that looks like e2e3 already: plaintext starting "e2e3:" must not pass
-		return e2eSeal(s, a.e2e.me, a.e2e.owner, a.e2e.me.PublicKey())
+		if form == "pair" {
+			return e2ePairSeal(s, a.e2e.me, a.e2e.owner, time.Now())
+		}
+		ct, err := e2eSeal(s, a.e2e.me, a.e2e.owner, a.e2e.me.PublicKey())
+		if err == nil && form == "" {
+			ct = asLegacy(ct)
+		}
+		return ct, err
 	}
 	st, err := seal(text)
 	if err != nil {
@@ -362,17 +558,16 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 	for _, b := range blocks {
 		switch b := b.(type) {
 		case *slack.SectionBlock:
-			c := *b
-			if c.Text != nil {
-				t := *c.Text
-				if t.Text, err = seal(t.Text); err != nil {
-					return "", nil, false, err
-				}
-				t.Type = slack.PlainTextType // the ciphertext is not mrkdwn
-				c.Text = &t
+			// sent as rich_text, not a section: Slack's client cuts long section text to "…" + Show more,
+			// and a cut ciphertext cannot be opened. Fields and accessory are dropped rather than leaked.
+			if b.Text == nil {
+				continue
 			}
-			c.Fields, c.Accessory = nil, nil // never used here; dropped rather than leaked
-			out = append(out, &c)
+			s, err := seal(b.Text.Text)
+			if err != nil {
+				return "", nil, false, err
+			}
+			out = append(out, slack.NewRichTextBlock(b.BlockID, slack.NewRichTextSection(slack.NewRichTextSectionTextElement(s, nil))))
 		case *slack.ActionBlock:
 			var els []slack.BlockElement
 			var legend []string
@@ -382,17 +577,20 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 					continue // a select or picker would show its options: dropped
 				}
 				n := len(els) + 1
-				v, err := seal(btn.Value)
+				label := btn.Value
+				if btn.Text != nil {
+					label = btn.Text.Text
+				}
+				// the label rides inside the sealed value, so sshhh can draw it on this very button:
+				// a label read from the legend could be put on any "Option n" button
+				pv, _ := json.Marshal(sealedButton{Label: label, Value: btn.Value})
+				v, err := seal(string(pv))
 				if err != nil {
 					return "", nil, false, err
 				}
 				nb := slack.NewButtonBlockElement(btn.ActionID, v, slack.NewTextBlockObject(slack.PlainTextType, fmt.Sprintf("Option %d", n), false, false))
 				nb.Style = btn.Style
 				els = append(els, nb)
-				label := btn.Value
-				if btn.Text != nil {
-					label = btn.Text.Text
-				}
 				legend = append(legend, fmt.Sprintf("Option %d: %s", n, label))
 			}
 			if len(els) == 0 {
@@ -426,4 +624,14 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, text string, blo
 		out = nil
 	}
 	return st, out, thread == "", nil
+}
+
+// newRootForm is the form a sealed new root (sealOut's newRoot) is marked with: its run's thread's.
+func (a *adapter) newRootForm(thread string) string {
+	if thread == "" && a.run != "" {
+		if l, err := a.runLink(a.run, 0); err == nil {
+			return a.sealedForm(l.thread)
+		}
+	}
+	return "pair"
 }

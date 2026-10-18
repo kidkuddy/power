@@ -127,7 +127,8 @@ func main() {
 		log.Fatalf("power: SLACK_BOT_TOKEN and NIFFTY_OWNER_ID must be set in %s", *envPath)
 	}
 	a := &adapter{
-		api:          slack.New(env["SLACK_BOT_TOKEN"], slack.OptionAppLevelToken(env["SLACK_APP_TOKEN"])),
+		api: slack.New(env["SLACK_BOT_TOKEN"], slack.OptionAppLevelToken(env["SLACK_APP_TOKEN"]),
+			slack.OptionHTTPClient(detailClient{http.DefaultClient})),
 		kami:         kamiClient(*sock),
 		owner:        env["NIFFTY_OWNER_ID"],
 		kekkai:       *kek,
@@ -303,7 +304,7 @@ type adapter struct {
 // post fails). Blocks are optional; text is always sent as the notification fallback.
 func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (string, string, error) {
 	e.Dir = "out"
-	im, err := e.Channel, error(nil)
+	im, err, sealed := e.Channel, error(nil), false
 	if im == "" {
 		im, err = a.dm(ctx)
 	}
@@ -315,6 +316,7 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 			a.record(e)
 			return "", "", err
 		}
+		sealed = text != e.Text
 		opts := []slack.MsgOption{slack.MsgOptionText(text, false)}
 		if blocks != nil {
 			opts = append(opts, slack.MsgOptionBlocks(blocks...))
@@ -325,7 +327,7 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 		if e.Channel, e.TS, err = a.api.PostMessageContext(ctx, im, opts...); err != nil {
 			err = fmt.Errorf("post message: %w", err)
 		} else if newRoot {
-			if err = a.markSealed(e.TS); err != nil { // posted sealed, but its thread would not stay sealed
+			if err = a.markSealed(e.TS, a.newRootForm(e.ThreadTS)); err != nil { // posted sealed, but its thread would not stay sealed
 				err = fmt.Errorf("posted %s sealed but could not mark its thread: %w", e.TS, err)
 			}
 		}
@@ -336,7 +338,27 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 		return "", "", err
 	}
 	a.record(e)
+	if e.Text != "" && sealed {
+		a.postCanvasCards(ctx, e.Channel, e.ThreadTS, e.Text)
+	}
 	return e.Channel, e.TS, nil
+}
+
+var canvasLink = regexp.MustCompile(`https://[a-z0-9-]+\.slack\.com/docs/T[A-Z0-9]+/F[A-Z0-9]+`)
+
+// postCanvasCards repeats each canvas link of a sealed post as its own plaintext
+// message: Slack cannot unfurl a link inside ciphertext, and the canvas itself
+// is plaintext on Slack already, so only the link's thread is new to it.
+func (a *adapter) postCanvasCards(ctx context.Context, channel, thread, text string) {
+	for _, u := range canvasLink.FindAllString(text, -1) {
+		opts := []slack.MsgOption{slack.MsgOptionText(u, false), slack.MsgOptionEnableLinkUnfurl()}
+		if thread != "" {
+			opts = append(opts, slack.MsgOptionTS(thread))
+		}
+		if _, _, err := a.api.PostMessageContext(ctx, channel, opts...); err != nil {
+			log.Printf("power: canvas card %s: %v", u, err)
+		}
+	}
 }
 
 // directory prints the owner, the owner's DM channel and every person's
@@ -469,7 +491,7 @@ func (a *adapter) canvas(ctx context.Context, key, title, markdown string, users
 }
 
 func (a *adapter) writeCanvas(ctx context.Context, key, title, markdown string, users []string) (string, error) {
-	doc := slack.DocumentContent{Type: "markdown", Markdown: markdown}
+	doc := slack.DocumentContent{Type: "markdown", Markdown: canvasMarkdown(markdown)}
 	var keyFile string
 	if key != "" {
 		if !slug.MatchString(key) {
@@ -500,6 +522,75 @@ func (a *adapter) writeCanvas(ctx context.Context, key, title, markdown string, 
 		}
 	}
 	return a.permalink(ctx, id)
+}
+
+var listItem = regexp.MustCompile(`^(\s*)([-*+]|\d+[.)])\s+`)
+
+// canvasMarkdown rewrites what canvases refuse: a numbered item under a bullet
+// ("Unsupported list type (numbered) within bullet list") becomes a bullet that
+// keeps its number in bold. Code fences are left as they are.
+func canvasMarkdown(md string) string {
+	type item struct {
+		indent int
+		bullet bool
+	}
+	var open []item // the list items this line may be nested under
+	fence := false
+	lines := strings.Split(md, "\n")
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		if strings.HasPrefix(t, "```") {
+			fence = !fence
+			continue
+		}
+		if fence || t == "" {
+			continue
+		}
+		m := listItem.FindStringSubmatch(l)
+		if m == nil {
+			if l[0] != ' ' && l[0] != '\t' {
+				open = nil // unindented text ends every list
+			}
+			continue
+		}
+		for len(open) > 0 && open[len(open)-1].indent >= len(m[1]) {
+			open = open[:len(open)-1]
+		}
+		bullet := strings.ContainsAny(m[2], "-*+")
+		if !bullet && len(open) > 0 && open[len(open)-1].bullet {
+			lines[i] = m[1] + "- **" + m[2] + "** " + l[len(m[0]):]
+			bullet = true
+		}
+		open = append(open, item{len(m[1]), bullet})
+	}
+	return strings.Join(lines, "\n")
+}
+
+// detailClient folds a failed call's `detail` into its `error`: slack-go keeps only the code
+// (canvas_creation_failed), and the detail is the part that says what to fix
+// ("line 44: Unsupported list type (numbered) within bullet list").
+type detailClient struct{ c *http.Client }
+
+func (d detailClient) Do(req *http.Request) (*http.Response, error) {
+	resp, err := d.c.Do(req)
+	if err != nil || !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+		return resp, err
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	var r map[string]any
+	if json.Unmarshal(body, &r) == nil && r["ok"] == false {
+		if detail, _ := r["detail"].(string); detail != "" {
+			r["error"] = fmt.Sprintf("%v: %s", r["error"], detail)
+			body, _ = json.Marshal(r)
+		}
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	return resp, nil
 }
 
 func (a *adapter) permalink(ctx context.Context, id string) (string, error) {
@@ -582,6 +673,7 @@ type state struct {
 	Banter  map[string]int       `json:"banter,omitempty"` // coworker -> messages handed to a session on Day
 	Convs   map[string][]convMsg `json:"convs,omitempty"`  // conversation key -> messages waiting while its session is busy
 	Sealed  map[string]bool      `json:"sealed,omitempty"` // read once to move into e2e-sealed/ (see markSealed), then dropped
+	Asleep  map[string]string    `json:"asleep,omitempty"` // chat thread -> its note of the chat going to sleep
 }
 
 type queued struct {
@@ -603,7 +695,7 @@ type thread struct {
 func (a *adapter) statePath() string { return filepath.Join(a.dir, "slack.json") }
 
 func (a *adapter) load() error {
-	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}, Convs: map[string][]convMsg{}}
+	a.st = state{Threads: map[string]*thread{}, Queue: map[string][]queued{}, Cards: map[string]*card{}, Banter: map[string]int{}, Convs: map[string][]convMsg{}, Asleep: map[string]string{}}
 	raw, err := os.ReadFile(a.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -629,8 +721,11 @@ func (a *adapter) load() error {
 	if a.st.Convs == nil {
 		a.st.Convs = map[string][]convMsg{}
 	}
+	if a.st.Asleep == nil {
+		a.st.Asleep = map[string]string{}
+	}
 	for ts := range a.st.Sealed { // older builds kept sealed threads in this file
-		if err := a.markSealed(ts); err != nil {
+		if err := a.markSealed(ts, ""); err != nil {
 			return err
 		}
 	}

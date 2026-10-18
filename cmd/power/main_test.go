@@ -184,8 +184,8 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "conversations.open":
 		out = map[string]any{"channel": map[string]any{"id": "D1"}}
 	case "chat.postMessage":
-		if r.Form.Get("thread_ts") == "999.9" {
-			out = map[string]any{"ok": false, "error": "invalid_thread_ts"}
+		if code := map[string]string{"999.9": "invalid_thread_ts", "998.9": "msg_too_long", "997.9": "internal_error"}[r.Form.Get("thread_ts")]; code != "" {
+			out = map[string]any{"ok": false, "error": code}
 			break
 		}
 		s.n++
@@ -193,6 +193,10 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "chat.update":
 		out = map[string]any{"channel": "D1", "ts": r.Form.Get("ts")}
 	case "canvases.create":
+		if strings.Contains(r.Form.Get("document_content"), "nested") {
+			out = map[string]any{"ok": false, "error": "canvas_creation_failed", "detail": "line 2: Unsupported list type (numbered) within bullet list"}
+			break
+		}
 		s.n++
 		out = map[string]any{"canvas_id": fmt.Sprintf("F%d", s.n)}
 	case "conversations.replies":
@@ -218,7 +222,7 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "files.completeUploadExternal":
 		out = map[string]any{"files": []map[string]any{{"id": "FPIC", "title": "power.gif"}}}
-	case "canvases.edit", "canvases.access.set", "reactions.add", "pins.add", "pins.remove":
+	case "canvases.edit", "canvases.access.set", "reactions.add", "pins.add", "pins.remove", "chat.delete":
 		out = map[string]any{}
 	case "files.info":
 		out = map[string]any{"file": map[string]any{"id": r.Form.Get("file"), "permalink": "https://x.slack.com/docs/T1/" + r.Form.Get("file")}}
@@ -228,6 +232,7 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if _, set := out["ok"]; !set {
 		out["ok"] = true
 	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(out)
 }
 
@@ -266,7 +271,7 @@ func setup(t *testing.T) (*fakeKami, *fakeSlack, func() *adapter) {
 	s.url = ss.URL
 	t.Cleanup(ss.Close)
 	start := func() *adapter {
-		a := &adapter{api: slack.New("xoxb-fake", slack.OptionAPIURL(ss.URL+"/")), kami: kamiClient(sock),
+		a := &adapter{api: slack.New("xoxb-fake", slack.OptionAPIURL(ss.URL+"/"), slack.OptionHTTPClient(detailClient{http.DefaultClient})), kami: kamiClient(sock),
 			owner: owner, dir: filepath.Join(dir, "adapters"), chatKekkai: "work", chatWorkflow: "chat", replyAnswers: true}
 		if err := a.load(); err != nil {
 			t.Fatal(err)
@@ -340,7 +345,8 @@ func TestServe(t *testing.T) {
 	must(a.onAction(ctx, tap(owner, "c1", "keep")))
 	up := s.of("chat.update")
 	if len(k.resolves) != 1 || k.resolves[0] != "c1=keep map[]" || len(up) != 1 || up[0].Get("ts") != "100.1" ||
-		strings.Contains(up[0].Get("blocks"), "action_id") || !strings.Contains(up[0].Get("blocks"), "answered *keep* by \\u003c@UOWNER\\u003e") {
+		strings.Contains(up[0].Get("blocks"), "action_id") || !strings.Contains(up[0].Get("blocks"), "answered *keep* by \\u003c@UOWNER\\u003e") ||
+		strings.Contains(up[0].Get("text"), "Keep the draft?") {
 		t.Fatalf("tap: resolves %v update %v", k.resolves, up)
 	}
 
@@ -372,6 +378,17 @@ func TestServe(t *testing.T) {
 		!strings.Contains(p[before].Get("text"), "resolver already answered: 8080") || len(a.st.Threads) != 0 {
 		t.Fatalf("follow-ups = %v threads %v", p[before:], a.st.Threads)
 	}
+
+	// a tap on a contract POWER no longer tracks: the message loses its buttons, with a note
+	cb := tap(owner, "c1", "keep")
+	cb.Message.Timestamp = "100.1"
+	cb.Message.Blocks = slack.Blocks{BlockSet: contractBlocks("Keep the draft?", "c1", []string{"keep"}, "", true)}
+	must(a.onAction(ctx, cb))
+	up = s.of("chat.update")
+	if u := up[len(up)-1]; u.Get("ts") != "100.1" || strings.Contains(u.Get("blocks"), "action_id") ||
+		!strings.Contains(u.Get("blocks"), "Keep the draft?") || !strings.Contains(u.Get("blocks"), "already settled") {
+		t.Fatalf("unknown tap redraw = %v", u)
+	}
 }
 
 func TestCanvasAndDM(t *testing.T) {
@@ -386,7 +403,10 @@ func TestCanvasAndDM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u1 != u2 || len(s.of("canvases.create")) != 1 || len(s.of("canvases.edit")) != 1 {
+	if _, err := a.canvas(ctx, "", "Bad", "- nested", nil); err == nil || !strings.Contains(err.Error(), "line 2: Unsupported list type") {
+		t.Fatalf("canvas error lost Slack's detail: %v", err)
+	}
+	if u1 != u2 || len(s.of("canvases.create")) != 2 || len(s.of("canvases.edit")) != 1 {
 		t.Fatalf("keyed canvas: %s %s, %d creates", u1, u2, len(s.of("canvases.create")))
 	}
 	acc := s.of("canvases.access.set")
@@ -405,6 +425,21 @@ func TestCanvasAndDM(t *testing.T) {
 	ch, ts, err := a.post(ctx, entry{Kind: "dm", Text: "hello"}, nil)
 	if err != nil || ch != "D1" || ts == "" {
 		t.Fatalf("dm = %s %s %v", ch, ts, err)
+	}
+}
+
+func TestCanvasMarkdown(t *testing.T) {
+	for in, want := range map[string]string{
+		"- a\n  1. b\n": "- a\n  - **1.** b\n", // the probe Slack refused at line 2
+		"- Shows: list:\n  1. Finish,\n     wrapped\n  2. Errors\n- Reuses: x": "- Shows: list:\n  - **1.** Finish,\n     wrapped\n  - **2.** Errors\n- Reuses: x",
+		"1. a\n2. b\n   1. c":    "1. a\n2. b\n   1. c", // numbered in numbered is fine
+		"- a\n\n1. b":            "- a\n\n1. b",         // a new list, not nested
+		"- a\n```\n  1. b\n```":  "- a\n```\n  1. b\n```",
+		"- a\n  1. b\n     1. c": "- a\n  - **1.** b\n     - **1.** c",
+	} {
+		if got := canvasMarkdown(in); got != want {
+			t.Errorf("canvasMarkdown(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -899,13 +934,16 @@ func TestRunThreads(t *testing.T) {
 		t.Fatalf("ambiguous: resolves %v started %v", k.resolves, k.started)
 	}
 
-	// follow-ups land in the run thread, not under the contract message
+	// a cancelled contract says so on its own message, not in a post of its own
+	c2, n := a.st.Threads["c2"].TS, len(s.of("chat.postMessage"))
 	k.mu.Lock()
 	k.events = append(k.events, ev(15, "contract.cancelled", "rc", map[string]any{"id": "c2"}))
 	k.mu.Unlock()
 	must(a.events(ctx))
-	if l := last(); l.Get("thread_ts") != "700.1" || !strings.Contains(l.Get("text"), "Cancelled") {
-		t.Fatalf("follow-up = %v", l)
+	ups = s.of("chat.update")
+	if u := ups[len(ups)-1]; len(s.of("chat.postMessage")) != n || u.Get("ts") != c2 || !strings.Contains(u.Get("blocks"), "*Name?*") ||
+		!strings.Contains(u.Get("blocks"), "cancelled: the run moved on") {
+		t.Fatalf("cancelled: posts %d→%d, update %v", n, len(s.of("chat.postMessage")), u)
 	}
 
 	// a card read back from the state file (children omitted while empty) still takes a child line
@@ -916,7 +954,7 @@ func TestRunThreads(t *testing.T) {
 		kami.Event{Run: "rz", Type: "run.started"}, "late", "↳ POWER started late"))
 
 	// an AFK answer in rp's tree goes on rp's card, not into a message of its own
-	n := len(s.of("chat.postMessage"))
+	n = len(s.of("chat.postMessage"))
 	k.mu.Lock()
 	k.events = append(k.events, ev(16, "contract.resolved", "rp", map[string]any{"id": "c3", "by": "resolver", "answer": "good\nbecause"}))
 	k.mu.Unlock()
@@ -924,6 +962,37 @@ func TestRunThreads(t *testing.T) {
 	ups = s.of("chat.update")
 	if len(s.of("chat.postMessage")) != n || !strings.Contains(ups[len(ups)-1].Get("text"), "• 🤖 AFK answered: good …") {
 		t.Fatalf("afk on card: posts %d→%d, last update %v", n, len(s.of("chat.postMessage")), ups[len(ups)-1])
+	}
+}
+
+func TestRefusedEventDoesNotBlock(t *testing.T) {
+	ctx := context.Background()
+	k, s, start := setup(t)
+	now := time.Now()
+	for _, th := range []string{"998.9", "997.9", "700.1"} {
+		k.runs["r"+th] = map[string]any{"workflow": "chat", "vars": map[string]any{"thread_ts": th}}
+	}
+	fin := func(id int64, run string) kami.Event {
+		return kami.Event{ID: id, TS: now, Type: "run.finished", Run: run, Data: map[string]any{"status": "done"}}
+	}
+	k.events = []kami.Event{fin(1, "r998.9"), fin(2, "r700.1")}
+	a := start()
+	if err := a.events(ctx); err != nil || a.st.Since != 2 || len(s.of("chat.postMessage")) != 2 {
+		t.Fatalf("msg_too_long held the cursor: %v since %d posts %d", err, a.st.Since, len(s.of("chat.postMessage")))
+	}
+	// the chat going to sleep again in a thread: the older note goes
+	k.mu.Lock()
+	k.events = append(k.events, fin(3, "r700.1"))
+	k.mu.Unlock()
+	if err := a.events(ctx); err != nil || len(s.of("chat.delete")) != 1 || s.of("chat.delete")[0].Get("ts") != "100.1" || a.st.Asleep["700.1"] != "100.2" {
+		t.Fatalf("asleep notes: %v deletes %v state %v", err, s.of("chat.delete"), a.st.Asleep)
+	}
+	// a refusal that may pass (internal_error) keeps the event for the next poll
+	k.mu.Lock()
+	k.events = append(k.events, fin(4, "r997.9"), fin(5, "r700.1"))
+	k.mu.Unlock()
+	if err := a.events(ctx); err == nil || a.st.Since != 3 {
+		t.Fatalf("internal_error dropped the event: %v since %d", err, a.st.Since)
 	}
 }
 
