@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,7 +91,7 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		}
 		if ok && q.Get("status") == "active" && q.Get("kekkai") == "" {
 			for id, run := range k.runs {
-				if vars, _ := run["vars"].(map[string]any); vars["thread_ts"] == key && run["kekkai"] != nil {
+				if vars, _ := run["vars"].(map[string]any); vars["thread_ts"] == key && run["kekkai"] != nil && run["status"] != "done" {
 					runs = append(runs, map[string]any{"id": id, "workflow": run["workflow"], "kekkai": run["kekkai"]})
 				}
 			}
@@ -98,9 +99,10 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		if name, val, isVar := strings.Cut(q.Get("var"), "="); isVar && q.Get("status") == "" {
 			for id, run := range k.runs {
 				if vars, _ := run["vars"].(map[string]any); vars[name] == val {
-					runs = append(runs, map[string]any{"id": id, "workflow": run["workflow"]})
+					runs = append(runs, map[string]any{"id": id, "workflow": run["workflow"], "kekkai": run["kekkai"]})
 				}
 			}
+			sort.Slice(runs, func(i, j int) bool { return runs[i]["id"].(string) < runs[j]["id"].(string) }) // as kami: by id
 		}
 		env(w, runs, "", "")
 	})
@@ -118,7 +120,7 @@ func (k *fakeKami) handler(t *testing.T) http.Handler {
 		defer k.mu.Unlock()
 		var req map[string]any
 		json.NewDecoder(r.Body).Decode(&req)
-		if req["workflow"] != "chat" && req["workflow"] != "mr" && req["workflow"] != "converse" {
+		if req["workflow"] != "chat" && req["workflow"] != "mr" && req["workflow"] != "converse" && !(req["workflow"] == "checkin" && req["entry"] == "reply") {
 			env(w, nil, "NOT_FOUND", fmt.Sprintf("no workflow %q in kekkai work", req["workflow"]))
 			return
 		}

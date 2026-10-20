@@ -767,6 +767,9 @@ func (a *adapter) route(ctx context.Context, key string) error {
 	if kek != a.chatKekkai {
 		return nil // another kekkai's run owns the thread but is not listening yet: the queue waits for the next tick
 	}
+	if done, err := a.reopen(ctx, key, q); done || err != nil {
+		return err
+	}
 	var runs []struct {
 		ID       string `json:"id"`
 		Workflow string `json:"workflow"`
@@ -830,6 +833,75 @@ func (a *adapter) route(ctx context.Context, key string) error {
 	return nil
 }
 
+// reopen hands a reply in a sealed thread whose seal_kekkai runs have all ended (a check-in that
+// went quiet) back to that kekkai: the newest such run's workflow starts at its `reply` entry
+// with the queued text, in that run's sessions. The chat (another kekkai) never gets it: with
+// no workflow there taking replies, the owner is told and the queue is dropped. done is false
+// for any other thread.
+func (a *adapter) reopen(ctx context.Context, key string, q []queued) (done bool, _ error) {
+	if a.e2e == nil || len(a.e2e.kekkai) == 0 || !a.isSealed(key) {
+		return false, nil
+	}
+	var runs []struct {
+		ID       string `json:"id"`
+		Kekkai   string `json:"kekkai"`
+		Workflow string `json:"workflow"`
+	}
+	if err := a.kamiCall("GET", "/runs?"+url.Values{"var": {"thread_ts=" + key}}.Encode(), nil, &runs); err != nil {
+		return true, err
+	}
+	var texts []string
+	for _, m := range q {
+		texts = append(texts, m.Text)
+	}
+	text, kek, tried := strings.Join(texts, "\n\n"), "", map[string]bool{}
+	for i := len(runs) - 1; i >= 0; i-- { // ids sort by time: newest first
+		r := runs[i]
+		if r.Kekkai == a.chatKekkai || !a.e2e.kekkai[r.Kekkai] || tried[r.Kekkai+"/"+r.Workflow] {
+			continue
+		}
+		tried[r.Kekkai+"/"+r.Workflow], kek = true, r.Kekkai
+		var run struct {
+			ID string `json:"id"`
+		}
+		err := a.kamiCall("POST", "/runs", map[string]any{"kekkai": r.Kekkai, "workflow": r.Workflow, "entry": "reply",
+			"inputs": map[string]any{"thread_ts": key, "text": text, "kami_sessions": a.runSessions(r.ID)}}, &run)
+		var ke *kamiErr
+		if err != nil && !errors.As(err, &ke) {
+			return true, err // kami unreachable: keep the queue, retry next tick
+		}
+		if ke != nil {
+			continue // that workflow takes no replies
+		}
+		e := a.routed("started", key, queued{TS: q[0].TS, Text: text})
+		e.RunID = run.ID
+		a.record(e)
+		a.pop(key, len(q))
+		return true, a.save()
+	}
+	if kek == "" {
+		return false, nil
+	}
+	a.pop(key, len(q))
+	if err := a.save(); err != nil {
+		return true, err
+	}
+	_, _, err := a.post(ctx, entry{Kind: "error", ThreadTS: key, Text: "✗ Nothing in " + kek + " listens on this thread any more, and no workflow there takes a late reply. Start a new one."}, nil)
+	return true, err
+}
+
+// runSessions is a run's Claude sessions by state, for a later run that picks up its conversation.
+func (a *adapter) runSessions(id string) map[string]any {
+	var run struct {
+		Sessions map[string]any `json:"sessions"`
+	}
+	if err := a.kamiCall("GET", "/runs/"+url.PathEscape(id), nil, &run); err != nil {
+		a.logErr(err)
+		return nil
+	}
+	return run.Sessions
+}
+
 // lastSessions is the Claude sessions of the newest earlier run of workflow
 // tied to var=val: a chat that went to sleep wakes up in the same session.
 // var is always a kami_* input, which no worker can change.
@@ -851,14 +923,7 @@ func (a *adapter) lastSessions(workflow, key, val string) map[string]any {
 	if newest == "" {
 		return nil
 	}
-	var run struct {
-		Sessions map[string]any `json:"sessions"`
-	}
-	if err := a.kamiCall("GET", "/runs/"+url.PathEscape(newest), nil, &run); err != nil {
-		a.logErr(err)
-		return nil
-	}
-	return run.Sessions
+	return a.runSessions(newest)
 }
 
 // threadContracts is the ids of the open contracts posted in a thread, or as its root.

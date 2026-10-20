@@ -603,3 +603,50 @@ func TestRouteOtherKekkai(t *testing.T) {
 		t.Fatalf("listening: started %v queue %v", k.started, a.st.Queue)
 	}
 }
+
+// A reply in a sealed thread whose life runs have all ended reopens the newest one that takes
+// replies (checkin:reply, in its sessions); it never reaches the work chat. With no such
+// workflow the owner is told and nothing starts.
+func TestReopenEndedThread(t *testing.T) {
+	ctx := context.Background()
+	k, s, start := setup(t)
+	a := start()
+	ownerKey, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	if _, err := e2eSetup(a.dir, base64.StdEncoding.EncodeToString(ownerKey.PublicKey().Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if a.e2e, err = loadSealer(a.dir); err != nil {
+		t.Fatal(err)
+	}
+	a.e2e.kekkai = map[string]bool{"life": true, "scout": true}
+	k.mu.Lock()
+	k.runs["r1"] = map[string]any{"id": "r1", "workflow": "checkin", "kekkai": "life", "status": "done",
+		"vars": map[string]any{"thread_ts": "800.1"}, "sessions": map[string]any{"talk": "claude:s-old"}}
+	k.runs["r2"] = map[string]any{"id": "r2", "workflow": "deliver", "kekkai": "life", "status": "done", "vars": map[string]any{"thread_ts": "800.1"}}
+	k.runs["r3"] = map[string]any{"id": "r3", "workflow": "daily", "kekkai": "scout", "status": "done", "vars": map[string]any{"thread_ts": "900.1"}}
+	k.mu.Unlock()
+	a.markSealed("800.1", "pair")
+	a.markSealed("900.1", "pair")
+
+	// deliver (newest) takes no replies; checkin does, and resumes r1's session
+	if err := a.onMessage(ctx, reply(owner, "800.1", "800.2", ownerPair(t, "inbody is done", ownerKey, a.e2e.me.PublicKey(), time.Now()))); err != nil {
+		t.Fatal(err)
+	}
+	if len(k.started) != 1 || k.started[0]["kekkai"] != "life" || k.started[0]["workflow"] != "checkin" || k.started[0]["entry"] != "reply" || len(a.st.Queue["800.1"]) != 0 {
+		t.Fatalf("not reopened: started %v queue %v", k.started, a.st.Queue)
+	}
+	in := k.started[0]["inputs"].(map[string]any)
+	if in["text"] != "inbody is done" || in["thread_ts"] != "800.1" || in["kami_sessions"].(map[string]any)["talk"] != "claude:s-old" {
+		t.Fatalf("inputs %v", in)
+	}
+
+	// scout has no workflow taking replies: told, dropped, and no work chat starts
+	n := len(s.of("chat.postMessage"))
+	if err := a.onMessage(ctx, reply(owner, "900.1", "900.2", ownerPair(t, "more trends", ownerKey, a.e2e.me.PublicKey(), time.Now()))); err != nil {
+		t.Fatal(err)
+	}
+	if len(k.started) != 1 || len(a.st.Queue["900.1"]) != 0 || len(s.of("chat.postMessage")) != n+1 {
+		t.Fatalf("scout: started %v queue %v posts %d→%d", k.started, a.st.Queue, n, len(s.of("chat.postMessage")))
+	}
+}
