@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/slack-go/slack"
 
@@ -317,6 +318,13 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 			return "", "", err
 		}
 		sealed = text != e.Text
+		// Slack cuts a text over 4000 characters into several messages and only the first keeps the
+		// sealed header, so sshhh cannot open the rest: a long sealed post goes out as parts, each sealed
+		if n := utf8.RuneCountInString(text); sealed && blocks == nil && n > 4000 {
+			if parts := splitText(e.Text, len(e.Text)*3600/n); len(parts) > 1 {
+				return a.postParts(ctx, e, parts)
+			}
+		}
 		opts := []slack.MsgOption{slack.MsgOptionText(text, false)}
 		if blocks != nil {
 			opts = append(opts, slack.MsgOptionBlocks(blocks...))
@@ -342,6 +350,44 @@ func (a *adapter) post(ctx context.Context, e entry, blocks []slack.Block) (stri
 		a.postCanvasCards(ctx, e.Channel, e.ThreadTS, e.Text)
 	}
 	return e.Channel, e.TS, nil
+}
+
+// postParts posts each part as its own message, the later ones in the first one's thread
+// when e opens a new one. Each part goes through post, so each is sealed (and split) on its own.
+func (a *adapter) postParts(ctx context.Context, e entry, parts []string) (string, string, error) {
+	var channel, first string
+	for _, p := range parts {
+		pe := e
+		pe.Text = p
+		if pe.ThreadTS == "" {
+			pe.ThreadTS = first
+		}
+		c, ts, err := a.post(ctx, pe, nil)
+		if err != nil {
+			return "", "", err
+		}
+		if first == "" {
+			channel, first = c, ts
+		}
+	}
+	return channel, first, nil
+}
+
+// splitText cuts s into parts of at most max bytes, after a newline in the second half of a
+// part when there is one, never inside a rune.
+func splitText(s string, max int) (parts []string) {
+	for max > 0 && len(s) > max {
+		i := max
+		if j := strings.LastIndexByte(s[:i], '\n'); j >= max/2 {
+			i = j + 1
+		} else {
+			for i > 1 && !utf8.RuneStart(s[i]) {
+				i--
+			}
+		}
+		parts, s = append(parts, s[:i]), s[i:]
+	}
+	return append(parts, s)
 }
 
 var canvasLink = regexp.MustCompile(`https://[a-z0-9-]+\.slack\.com/docs/T[A-Z0-9]+/F[A-Z0-9]+`)

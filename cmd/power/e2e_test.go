@@ -523,6 +523,26 @@ func TestE2ESealKekkai(t *testing.T) {
 		t.Fatalf("milestone leaked: %q", got)
 	}
 
+	// a long post goes out as parts, each sealed and short enough that Slack does not cut it
+	long := strings.Repeat("ligne secrète, assez longue pour compter\n", 220)
+	n0 := len(s.of("chat.postMessage"))
+	if _, _, err := a.post(ctx, entry{ThreadTS: root, Text: long, RunID: "rlife"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var joined string
+	for _, m := range s.of("chat.postMessage")[n0:] {
+		got := m.Get("text")
+		b, _ := e2eDecode(got)
+		pt, _, _, err := e2ePairOpen(b, a.e2e.me, ownerKey.PublicKey())
+		if err != nil || utf8.RuneCountInString(got) > 4000 || m.Get("thread_ts") != root {
+			t.Fatalf("part: %v, %d runes, thread %q", err, utf8.RuneCountInString(got), m.Get("thread_ts"))
+		}
+		joined += pt
+	}
+	if parts := len(s.of("chat.postMessage")) - n0; parts < 2 || joined != long {
+		t.Fatalf("%d parts, joined back %v", parts, joined == long)
+	}
+
 	// refused, never sent: a life run posting to another channel or into a plaintext thread
 	n := len(s.of("chat.postMessage"))
 	a.run = "rlife"
