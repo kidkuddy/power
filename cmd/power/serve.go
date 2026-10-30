@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -25,10 +26,10 @@ import (
 )
 
 // serve runs the loop. Socket Mode delivers DMs and button taps down an
-// outbound websocket (no public endpoint); kami events are polled. One
-// goroutine handles both, so the state needs no lock.
-// ponytail: polls /events?since= instead of holding follow=1 open; latency is
-// one poll interval and a daemon restart needs no reconnect logic.
+// outbound websocket (no public endpoint); kami events arrive on an SSE stream.
+// One goroutine handles both, so the state needs no lock: the stream only wakes
+// the loop, and events() reads from the saved cursor, so a failed post is retried
+// and a dropped stream loses nothing. The poll stays as the retry and the safety net.
 func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 	if err := a.load(); err != nil {
 		return err
@@ -45,10 +46,14 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 	t := time.NewTicker(poll)
 	defer t.Stop()
 	a.logErr(a.events(ctx))
+	wake := make(chan struct{}, 1)
+	go a.stream(ctx, wake, a.st.Since)
 	for {
 		select {
 		case err := <-errc:
 			return fmt.Errorf("socket mode: %w", err)
+		case <-wake:
+			a.logErr(a.events(ctx))
 		case <-t.C:
 			a.logErr(a.events(ctx))
 			a.routeAll(ctx)
@@ -102,6 +107,58 @@ func (a *adapter) logErr(err error) {
 }
 
 // --- kami → Slack --------------------------------------------------------------
+
+// stream holds the SSE connection to Kami and wakes the loop on each event, reconnecting from
+// the last id it saw until ctx ends. It keeps its own id: the state belongs to the loop.
+func (a *adapter) stream(ctx context.Context, wake chan<- struct{}, since int64) {
+	for ctx.Err() == nil {
+		var err error
+		if since, err = a.followEvents(ctx, wake, since); err != nil && ctx.Err() == nil {
+			log.Printf("power: event stream: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func (a *adapter) followEvents(ctx context.Context, wake chan<- struct{}, since int64) (int64, error) {
+	q := url.Values{}
+	if a.kekkai != "" {
+		q.Set("kekkai", a.kekkai)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://kami/events?"+q.Encode(), nil)
+	if err != nil {
+		return since, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Last-Event-ID", fmt.Sprint(since))
+	c := *a.kami
+	c.Timeout = 0 // a stream has no end to time
+	resp, err := c.Do(req)
+	if err != nil {
+		return since, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		return since, fmt.Errorf("kami did not answer with SSE: %s %s", resp.Status, resp.Header.Get("Content-Type"))
+	}
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 1<<20), 16<<20)
+	for sc.Scan() {
+		if id, ok := strings.CutPrefix(sc.Text(), "id: "); ok {
+			if n, err := strconv.ParseInt(id, 10, 64); err == nil {
+				since = n
+			}
+			select {
+			case wake <- struct{}{}:
+			default: // a wake is pending: its events() reads this one too
+			}
+		}
+	}
+	return since, sc.Err()
+}
 
 func (a *adapter) events(ctx context.Context) error {
 	// every type: the filter takes one prefix and milestones are run.* events

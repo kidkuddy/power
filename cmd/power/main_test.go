@@ -1201,3 +1201,31 @@ func TestOwnerImage(t *testing.T) {
 		t.Fatalf("conversations.open = %v", o)
 	}
 }
+
+// The SSE stream only wakes the loop: it sends its cursor, and a non-SSE answer is an error.
+func TestFollowEvents(t *testing.T) {
+	var gotID, gotAccept string
+	sse := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotID, gotAccept = r.Header.Get("Last-Event-ID"), r.Header.Get("Accept")
+		if sse {
+			w.Header().Set("Content-Type", "text/event-stream")
+		}
+		fmt.Fprint(w, "id: 6\nevent: run.say\ndata: {}\n\n: ping\n\nid: 7\nevent: run.say\ndata: {}\n\n")
+	}))
+	defer srv.Close()
+	addr := srv.Listener.Addr().String()
+	a := &adapter{kami: &http.Client{Timeout: time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		}}}}
+	wake := make(chan struct{}, 1)
+	since, err := a.followEvents(context.Background(), wake, 5)
+	if err != nil || since != 7 || gotID != "5" || gotAccept != "text/event-stream" || len(wake) != 1 {
+		t.Fatalf("since %d err %v Last-Event-ID %q Accept %q wakes %d", since, err, gotID, gotAccept, len(wake))
+	}
+	sse = false
+	if since, err := a.followEvents(context.Background(), wake, 7); err == nil || since != 7 {
+		t.Fatalf("a non-SSE answer: since %d err %v", since, err)
+	}
+}
