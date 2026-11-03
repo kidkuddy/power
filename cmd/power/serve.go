@@ -69,6 +69,11 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 			case socketmode.EventTypeConnectionError:
 				if c, ok := evt.Data.(*slack.ConnectionErrorEvent); ok {
 					log.Printf("power: Slack connection error (attempt %d, retry in %v): %v", c.Attempt, c.Backoff, c.ErrorObj)
+					// slack-go's backoff has no cap (7h by attempt 19): past a minute, exit and let launchd
+					// (KeepAlive) start a fresh connection instead of missing the owner's DMs for hours.
+					if c.Backoff > maxReconnectWait {
+						return fmt.Errorf("socket mode: retry in %v is too long, restarting", c.Backoff)
+					}
 				}
 			case socketmode.EventTypeDisconnect:
 				if evt.Request != nil {
@@ -218,6 +223,8 @@ func (a *adapter) events(ctx context.Context) error {
 func followed(typ string) bool {
 	return strings.HasPrefix(typ, "contract.") || typ == "run.say" || typ == "run.started" || typ == "run.finished"
 }
+
+const maxReconnectWait = time.Minute
 
 // ponytail: a milestone older than this is history being replayed (the adapter
 // was down, or upgraded from a contract-only cursor) and is not posted.
