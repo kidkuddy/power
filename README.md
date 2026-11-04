@@ -48,6 +48,7 @@ or both will receive the same Socket Mode events. She talks to the Kami daemon o
 ```sh
 power serve [--poll 5s] [--kekkai K]        # the bot: contracts → DMs, DMs → chats
       [--chat-kekkai work] [--chat-workflow chat] [--coworkers=true] [--mr-workflow mr] [--conv-workflow converse]
+      [--reply-answers]                     # a thread reply answers its open contract itself (see below)
 power dm [--channel C] [--thread TS] "text" # DM the owner (or post to C); prints {"channel","ts"}
 power answer [--data JSON] <contract> <answer>   # answer as the owner; refuses 🔒 contracts
 power react [--channel C] <ts> <emoji>
@@ -63,17 +64,22 @@ Workflow scripts call these: a chat posts its reply with `power dm --thread {thr
 
 ## How a message finds its run
 
-When you reply in a thread, POWER tries these in order:
+By default every reply goes to chat: the message is published as `slack.message` keyed by the
+thread, for a chat run waiting on it. If the run is busy, the message queues until it listens
+again. If there's no run, a new chat run starts with the thread so far as `history`. The thread's open
+contract ids go with it as `thread_contracts`, and the chat run answers them itself with
+`power answer`. Buttons still
+resolve contracts directly.
+
+With `--reply-answers`, POWER first tries to answer a contract from the reply, in this order,
+and falls back to chat:
 
 1. The contract whose message the thread hangs under.
 2. The one open contract of the thread's runs that takes text: an `ask`, a `form`, or a choice
    whose options include your reply (case-insensitive).
-3. Chat: the message is published as `slack.message` keyed by the thread, for a chat run waiting
-   on it. If the run is busy, the message queues until it listens again. If there's no run, a new
-   chat run starts with the thread so far as `history`.
 
-`answer field=value …` fills a form. Values parse as JSON when they can. A refusal from Kami
-comes back in the thread.
+There, `answer field=value …` fills a form. Values parse as JSON when they can. A refusal from
+Kami comes back in the thread.
 
 ## Encrypted threads
 
