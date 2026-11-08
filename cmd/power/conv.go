@@ -141,8 +141,9 @@ func (a *adapter) routeConv(ctx context.Context, key string, m coMsg) error {
 	return a.save()
 }
 
-// ponytail: the last 20 messages; a longer conversation's start is dropped.
-const convHistory = 20
+// convHistoryLimit is the ponytail of a conversation: the last 20 messages;
+// a longer conversation's start is dropped.
+const convHistoryLimit = 20
 
 // convHistory is the conversation before the queued messages as "name: text"
 // lines, so a new session knows who said what. Empty when Slack will not
@@ -158,7 +159,7 @@ func (a *adapter) convHistory(ctx context.Context, m coMsg, q []convMsg) string 
 		msgs, err = a.repliesIn(ctx, m.channel, m.thread)
 	} else {
 		var h *slack.GetConversationHistoryResponse
-		h, err = a.api.GetConversationHistoryContext(ctx, &slack.GetConversationHistoryParameters{ChannelID: m.channel, Limit: convHistory + len(q)})
+		h, err = a.api.GetConversationHistoryContext(ctx, &slack.GetConversationHistoryParameters{ChannelID: m.channel, Limit: convHistoryLimit + len(q)})
 		if err == nil {
 			msgs = h.Messages
 			for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 { // newest first → oldest first
@@ -181,8 +182,8 @@ func (a *adapter) convHistory(ctx context.Context, m coMsg, q []convMsg) string 
 		}
 		lines = append(lines, who+": "+unslack(x.Text))
 	}
-	if len(lines) > convHistory {
-		lines = lines[len(lines)-convHistory:]
+	if len(lines) > convHistoryLimit {
+		lines = lines[len(lines)-convHistoryLimit:]
 	}
 	return strings.Join(lines, "\n")
 }

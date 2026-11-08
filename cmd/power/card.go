@@ -101,8 +101,11 @@ func (a *adapter) onCard(ctx context.Context, rootID string, root link, ev kami.
 		}
 	}
 	limit, size := 3000, utf8.RuneCountInString // a section's text
-	if a.e2e != nil && a.isSealed(c.Thread) {
-		limit, size = sealedMax(a.sealedForm(c.Thread)), func(s string) int { return len(s) }
+	if a.e2e != nil {
+		sealed, err := a.isSealed(c.Thread)
+		if err == nil && sealed {
+			limit, size = sealedMax(a.sealedForm(c.Thread)), func(s string) int { return len(s) }
+		}
 	}
 	t := c.text(limit, size)
 	e := entry{Dir: "out", Kind: "card", Channel: a.im, TS: c.TS, ThreadTS: c.Thread, Text: t, RunID: rootID, Workflow: root.workflow}

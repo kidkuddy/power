@@ -25,6 +25,40 @@ import (
 	"power/internal/kami"
 )
 
+// imageRetention is how long a downloaded image in $KAMI_HOME/adapters/files
+// is kept before cleanup removes it.
+const imageRetention = 7 * 24 * time.Hour
+
+// cleanupImages removes downloaded images older than imageRetention from
+// $KAMI_HOME/adapters/files, so saved attachments do not grow without bound.
+func (a *adapter) cleanupImages() error {
+	dir := filepath.Join(a.dir, "files")
+	infos, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	cutoff := time.Now().Add(-imageRetention)
+	for _, fi := range infos {
+		if fi.IsDir() {
+			continue
+		}
+		info, err := fi.Info()
+		if err != nil {
+			a.logErr(err)
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
+				a.logErr(err)
+			}
+		}
+	}
+	return nil
+}
+
 // serve runs the loop. Socket Mode delivers DMs and button taps down an
 // outbound websocket (no public endpoint); kami events arrive on an SSE stream.
 // One goroutine handles both, so the state needs no lock: the stream only wakes
@@ -43,6 +77,9 @@ func (a *adapter) serve(ctx context.Context, poll time.Duration) error {
 	errc := make(chan error, 1)
 	go func() { errc <- sm.RunContext(ctx) }()
 	log.Printf("power: serving; state %s, from event %d", a.statePath(), a.st.Since)
+	if err := a.cleanupImages(); err != nil {
+		log.Printf("power: image cleanup: %v", err)
+	}
 	t := time.NewTicker(poll)
 	defer t.Stop()
 	a.logErr(a.events(ctx))
@@ -676,8 +713,13 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 	}
 	// the forms without a sealed time are only taken in threads already sealed in them: otherwise Slack could
 	// repost an old e2e3 message as a new conversation, or into a pair thread, past the replay check
-	if readable && plain != m.Text && form != "pair" && (!a.isSealed(sealKey) || a.sealedForm(sealKey) == "pair") {
-		readable = false
+	if readable && plain != m.Text && form != "pair" {
+		sealed, err := a.isSealed(sealKey)
+		if err != nil {
+			readable = false
+		} else if !sealed || a.sealedForm(sealKey) == "pair" {
+			readable = false
+		}
 	}
 	if !readable { // e2e3 POWER cannot open: wrong key, not from the owner's key, tampered, or replayed
 		in.Error = "e2e3: unreadable"
@@ -768,7 +810,14 @@ func (a *adapter) onMessage(ctx context.Context, m *slackevents.MessageEvent) er
 // kekkai tied to the thread (a life check-in), else --chat-kekkai. Any worker can set a
 // thread_ts var, so only a seal_kekkai kekkai is trusted, and only in a thread POWER sealed.
 func (a *adapter) threadKekkai(key string) (string, error) {
-	if a.e2e == nil || len(a.e2e.kekkai) == 0 || !a.isSealed(key) {
+	if a.e2e == nil || len(a.e2e.kekkai) == 0 {
+		return a.chatKekkai, nil
+	}
+	sealed, err := a.isSealed(key)
+	if err != nil {
+		return "", err
+	}
+	if !sealed {
 		return a.chatKekkai, nil
 	}
 	var runs []struct {
@@ -903,7 +952,14 @@ func (a *adapter) route(ctx context.Context, key string) error {
 // no workflow there taking replies, the owner is told and the queue is dropped. done is false
 // for any other thread.
 func (a *adapter) reopen(ctx context.Context, key string, q []queued) (done bool, _ error) {
-	if a.e2e == nil || len(a.e2e.kekkai) == 0 || !a.isSealed(key) {
+	if a.e2e == nil || len(a.e2e.kekkai) == 0 {
+		return false, nil
+	}
+	sealed, err := a.isSealed(key)
+	if err != nil {
+		return true, err
+	}
+	if !sealed {
 		return false, nil
 	}
 	var runs []struct {
@@ -940,18 +996,24 @@ func (a *adapter) reopen(ctx context.Context, key string, q []queued) (done bool
 		e := a.routed("started", key, queued{TS: q[0].TS, Text: text})
 		e.RunID = run.ID
 		a.record(e)
+		if err := a.save(); err != nil {
+			return true, err // keep the queue if the state cannot be persisted
+		}
 		a.pop(key, len(q))
-		return true, a.save()
+		return true, nil
 	}
 	if kek == "" {
 		return false, nil
+	}
+	_, _, err = a.post(ctx, entry{Kind: "error", ThreadTS: key, Text: "✗ Nothing in " + kek + " listens on this thread any more, and no workflow there takes a late reply. Start a new one."}, nil)
+	if err != nil {
+		return true, err // post failed: keep the queue, retry next tick
 	}
 	a.pop(key, len(q))
 	if err := a.save(); err != nil {
 		return true, err
 	}
-	_, _, err := a.post(ctx, entry{Kind: "error", ThreadTS: key, Text: "✗ Nothing in " + kek + " listens on this thread any more, and no workflow there takes a late reply. Start a new one."}, nil)
-	return true, err
+	return true, nil
 }
 
 // runSessions is a run's Claude sessions by state, for a later run that picks up its conversation.
