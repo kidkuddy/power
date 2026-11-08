@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -1227,5 +1228,175 @@ func TestFollowEvents(t *testing.T) {
 	sse = false
 	if since, err := a.followEvents(context.Background(), wake, 7); err == nil || since != 7 {
 		t.Fatalf("a non-SSE answer: since %d err %v", since, err)
+	}
+}
+
+// TestCoworkerBanterCap covers the per-coworker daily message cap: the cap
+// blocks Claude turns past banterPerDay, posts a canned line, and the owner
+// is never capped.
+func TestCoworkerBanterCap(t *testing.T) {
+	ctx := context.Background()
+	k, s, start := setup(t)
+	a := start()
+	a.coworkers, a.mrWorkflow, a.convWorkflow, a.botUser = true, "mr", "converse", "UPOWER"
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ch := func(user, ts, text string) *slackevents.MessageEvent {
+		return &slackevents.MessageEvent{ChannelType: "channel", Channel: "C1", User: user, TimeStamp: ts, Text: text}
+	}
+
+	a.st.Day = time.Now().Format("2006-01-02")
+	a.st.Banter = map[string]int{}
+	for i := 0; i < banterPerDay; i++ {
+		must(a.onMessage(ctx, ch("UEVE", fmt.Sprintf("20.%d", i), "<@UPOWER> spam")))
+	}
+	n := len(k.started)
+	must(a.onMessage(ctx, ch("UEVE", "21.1", "<@UPOWER> spam")))
+	if p := s.of("chat.postMessage"); len(k.started) != n || p[len(p)-1].Get("text") != "i only answer to name-uowner, bruh" {
+		t.Fatalf("cap: started %d→%d, last %v", n, len(k.started), p[len(p)-1])
+	}
+	// a banter cap message is not a Claude turn: nothing new was started
+	if len(k.started) != n {
+		t.Fatalf("cap started a run: %d→%d", n, len(k.started))
+	}
+	// the owner is never capped
+	must(a.onMessage(ctx, ch(owner, "22.1", "<@UPOWER> owner says hi")))
+	if len(k.started) == n {
+		t.Fatal("owner was capped like a coworker")
+	}
+}
+
+// TestCoworkerMRTap covers an MR link: a question with review/approve buttons,
+// a stranger's tap is ignored, the requester's tap starts the mr workflow and
+// redraws the question without buttons.
+func TestCoworkerMRTap(t *testing.T) {
+	ctx := context.Background()
+	k, s, start := setup(t)
+	a := start()
+	a.coworkers, a.mrWorkflow, a.convWorkflow, a.botUser = true, "mr", "converse", "UPOWER"
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := "<https://gitlab.com/acme/web/-/merge_requests/42|!42>"
+	must(a.onMessage(ctx, &slackevents.MessageEvent{ChannelType: "channel", Channel: "C1",
+		User: "UBOB", TimeStamp: "10.1", Text: "<@UPOWER> look " + link}))
+	posts := s.of("chat.postMessage")
+	if len(posts) != 1 || posts[0].Get("channel") != "C1" || posts[0].Get("thread_ts") != "10.1" ||
+		!strings.Contains(posts[0].Get("blocks"), "power:review") || !strings.Contains(posts[0].Get("blocks"), "power:approve") {
+		t.Fatalf("posts = %v", posts)
+	}
+	val, _ := json.Marshal(mrAsk{URL: "https://gitlab.com/acme/web/-/merge_requests/42", Requester: "UBOB", Channel: "C1", Thread: "10.1"})
+
+	must(a.onMRTap(ctx, "UEVE", "C1", "100.1", "approve", string(val)))
+	if len(k.started) != 0 {
+		t.Fatal("a stranger's tap started a run")
+	}
+	must(a.onMRTap(ctx, "UBOB", "C1", "100.1", "approve", string(val)))
+	if len(k.started) != 1 || k.started[0]["workflow"] != "mr" {
+		t.Fatalf("started = %v", k.started)
+	}
+	in := k.started[0]["inputs"].(map[string]any)
+	if in["action"] != "approve" || in["reply_ts"] != "10.1" || in["requester"] != "UBOB" ||
+		in["url"] != "https://gitlab.com/acme/web/-/merge_requests/42" {
+		t.Fatalf("inputs = %v", in)
+	}
+	if u := s.of("chat.update"); len(u) != 1 || strings.Contains(u[0].Get("blocks"), "power:") {
+		t.Fatalf("redraw = %v", u)
+	}
+}
+
+// TestAddressed covers addressed(): a channel message without her mention or
+// an existing conversation/run is not addressed; a mention or an active run
+// makes it addressed.
+func TestAddressed(t *testing.T) {
+	ctx := context.Background()
+	k, _, start := setup(t)
+	a := start()
+	a.coworkers, a.chatKekkai, a.chatWorkflow, a.botUser = true, "work", "chat", "UPOWER"
+
+	// plain channel chatter: not addressed
+	if a.addressed(ctx, coMsg{"UBOB", "lunch anyone?", "C1", "10.1", "", "channel"}) {
+		t.Fatal("plain chatter taken as addressed")
+	}
+
+	// a mention of her: addressed
+	if !a.addressed(ctx, coMsg{"UBOB", "<@UPOWER> ping", "C1", "10.2", "", "channel"}) {
+		t.Fatal("mention not taken as addressed")
+	}
+
+	// an existing conversation in that channel: addressed
+	a.st.Convs["chan:C1"] = []convMsg{{Text: "hi", From: "UBOB", TS: "10.1"}}
+	if !a.addressed(ctx, coMsg{"UBOB", "still here", "C1", "10.3", "", "channel"}) {
+		t.Fatal("existing conversation not taken as addressed")
+	}
+
+	// an active run for that key: addressed
+	delete(a.st.Convs, "chan:C1")
+	k.busy["chan:C1"] = true
+	if !a.addressed(ctx, coMsg{"UBOB", "busy thread", "C1", "10.4", "", "channel"}) {
+		t.Fatal("active run not taken as addressed")
+	}
+	delete(k.busy, "chan:C1")
+}
+
+// TestCardText covers the status card's text: runes cut per line, duplicate
+// runs collapsed with ×n, oldest dropped until it fits the limit.
+func TestCardText(t *testing.T) {
+	c := &card{Title: "goal `g`", Status: "running", Lines: []string{
+		"one", "one", "one", "two", strings.Repeat("x", 300),
+	}}
+	got := c.text(1000, func(s string) int { return utf8.RuneCountInString(s) })
+	if !strings.Contains(got, "one ×3") || !strings.Contains(got, "two") ||
+		!strings.Contains(got, "…") || strings.Contains(got, strings.Repeat("x", 300)) {
+		t.Fatalf("card text = %q", got)
+	}
+	// drop oldest until it fits (head+foot is a floor)
+	got = c.text(60, func(s string) int { return utf8.RuneCountInString(s) })
+	if !strings.Contains(got, "• …") {
+		t.Fatalf("oldest lines not dropped: %q", got)
+	}
+}
+
+// TestAuditTranscript covers the transcript entry shape and that a failed
+// write is only logged, never fatal.
+func TestAuditTranscript(t *testing.T) {
+	_, _, start := setup(t)
+	a := start()
+	a.record(entry{Dir: "in", Kind: "dm", Channel: "D1", TS: "1.1", User: owner, Text: "hi"})
+	a.record(entry{Dir: "out", Kind: "dm", Channel: "D1", TS: "2.1", Text: "hello"})
+	raw, err := os.ReadFile(a.transcriptPath())
+	if err != nil {
+		t.Fatalf("transcript not written: %v", err)
+	}
+	var es []entry
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var e entry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("transcript line not JSON: %q: %v", line, err)
+		}
+		es = append(es, e)
+	}
+	if len(es) != 2 || es[0].Dir != "in" || es[0].Kind != "dm" || es[0].User != owner ||
+		es[1].Dir != "out" || es[1].Kind != "dm" || es[0].LoggedAt == "" || es[1].LoggedAt == "" {
+		t.Fatalf("transcript entries = %+v", es)
+	}
+	// a directory we cannot write to: record logs instead of dying
+	ro := filepath.Join(a.dir, "ro")
+	if err := os.MkdirAll(ro, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	a2 := start()
+	a2.dir = ro
+	a2.record(entry{Dir: "in", Kind: "dm", Channel: "D1", TS: "3.1", User: owner, Text: "hi"})
+	_, err = os.ReadFile(a2.transcriptPath())
+	if err == nil || !os.IsNotExist(err) {
+		t.Fatalf("expected unwritable transcript, got %v", err)
 	}
 }

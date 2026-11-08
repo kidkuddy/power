@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -164,8 +165,11 @@ func TestE2EThread(t *testing.T) {
 	if err := a.onMessage(ctx, reply(owner, "", "300.1", in)); err != nil {
 		t.Fatal(err)
 	}
-	if len(k.started) != 1 || k.started[0]["inputs"].(map[string]any)["text"] != "deploy the <secret> thing" || !a.isSealed("300.1") {
-		t.Fatalf("started %v sealed %v", k.started, a.isSealed("300.1"))
+	if len(k.started) != 1 || k.started[0]["inputs"].(map[string]any)["text"] != "deploy the <secret> thing" {
+		t.Fatalf("started %v", k.started)
+	}
+	if sealed, err := a.isSealed("300.1"); err != nil || !sealed {
+		t.Fatalf("thread not sealed: %v %v", err, sealed)
 	}
 
 	// POWER's posts in that thread reach Slack as ciphertext only, text and blocks
@@ -212,8 +216,9 @@ func TestE2EThread(t *testing.T) {
 		if err := a.onMessage(ctx, reply(owner, ts[0], ts[1], in)); err != nil {
 			t.Fatal(err)
 		}
-		if len(k.started) != 2 || a.isSealed("700.1") {
-			t.Fatalf("downgrade to e2e3 in %q accepted: started %d", ts[0], len(k.started))
+		if len(k.started) != 2 {
+			sealed, err := a.isSealed(ts[1])
+			t.Fatalf("downgrade to e2e3 in %q accepted: started %d sealed %v err %v", ts[0], len(k.started), sealed, err)
 		}
 	}
 	// POWER's own pair reply posted under the owner's name is not the owner speaking
@@ -267,8 +272,9 @@ func TestE2EThread(t *testing.T) {
 	_, root, err := a.post(ctx, entry{Text: "🧵 build the secret thing"}, nil)
 	a.run = ""
 	p = s.of("chat.postMessage")
-	if err != nil || !sealedText(p[len(p)-1].Get("text")) || !a.isSealed(root) {
-		t.Fatalf("launched root: %v %v sealed %v", err, p[len(p)-1], a.isSealed(root))
+	if err != nil || !sealedText(p[len(p)-1].Get("text")) {
+		sealed, err2 := a.isSealed(root)
+		t.Fatalf("launched root: %v %v sealed %v err %v", err, p[len(p)-1], sealed, err2)
 	}
 	a.post(ctx, entry{ThreadTS: root, Text: "milestone of the launched run"}, nil)
 	a.run = "rplain" // a run of a plain thread posting a new root stays plain
@@ -369,8 +375,9 @@ func TestE2EThread(t *testing.T) {
 		t.Fatal(err)
 	}
 	p = s.of("chat.postMessage")
-	if len(k.started) != 3 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") || a.isSealed("500.1") {
-		t.Fatalf("stranger: started %d last %v", len(k.started), p[len(p)-1])
+	if len(k.started) != 3 || !strings.Contains(p[len(p)-1].Get("text"), "could not decrypt") {
+		sealed, err := a.isSealed("500.1")
+		t.Fatalf("stranger: started %d last %v sealed %v err %v", len(k.started), p[len(p)-1], sealed, err)
 	}
 }
 
@@ -391,8 +398,8 @@ func TestE2EMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 	a = start()
-	if !a.isSealed("300.9") || a.st.Sealed != nil {
-		t.Fatalf("migrate: sealed %v state %v", a.isSealed("300.9"), a.st.Sealed)
+	if sealed, err := a.isSealed("300.9"); err != nil || !sealed || a.st.Sealed != nil {
+		t.Fatalf("migrate: sealed %v err %v state %v", sealed, err, a.st.Sealed)
 	}
 
 	// power dm from the CLI migrates too, without rewriting slack.json
@@ -401,8 +408,11 @@ func TestE2EMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 	cli := &adapter{dir: a.dir}
-	if err := cli.load(); err != nil || !cli.isSealed("301.1") {
-		t.Fatalf("cli migrate: %v %v", err, cli.isSealed("301.1"))
+	if err := cli.load(); err != nil {
+		t.Fatalf("cli migrate: %v", err)
+	}
+	if sealed, err := cli.isSealed("301.1"); err != nil || !sealed {
+		t.Fatalf("cli migrate: sealed %v err %v", sealed, err)
 	}
 	if after, _ := os.ReadFile(a.statePath()); string(after) != `{"since": 1, "sealed": {"301.1": true}}` {
 		t.Fatalf("load rewrote slack.json: %s (was %s)", after, before)
@@ -491,8 +501,8 @@ func TestE2ESealKekkai(t *testing.T) {
 	a.run = ""
 	p := s.of("chat.postMessage")
 	pb, _ := e2eDecode(p[len(p)-1].Get("text"))
-	if pt, _, _, oerr := e2ePairOpen(pb, a.e2e.me, ownerKey.PublicKey()); err != nil || oerr != nil || pt != "☀️ daily: the secret plan" || !a.isSealed(root) || a.sealedForm(root) != "pair" {
-		t.Fatalf("root %v: %q %v %v sealed %v", err, pt, oerr, p[len(p)-1], a.isSealed(root))
+	if pt, _, _, oerr := e2ePairOpen(pb, a.e2e.me, ownerKey.PublicKey()); err != nil || oerr != nil || pt != "☀️ daily: the secret plan" || a.sealedForm(root) != "pair" {
+		t.Fatalf("root %v: %q %v %v sealed %v", err, pt, oerr, p[len(p)-1], a.sealedForm(root))
 	}
 
 	// a contract of a thread-less life run (serve passes the run id): sealed too
@@ -648,5 +658,99 @@ func TestReopenEndedThread(t *testing.T) {
 	}
 	if len(k.started) != 1 || len(a.st.Queue["900.1"]) != 0 || len(s.of("chat.postMessage")) != n+1 {
 		t.Fatalf("scout: started %v queue %v posts %d→%d", k.started, a.st.Queue, n, len(s.of("chat.postMessage")))
+	}
+}
+
+// TestE2EAdapterSealUnseal covers the adapter-level seal/unseal: plain text
+// passes through, sealed e2e3 text opens to plaintext, a sealed thread's posts
+// come back ciphertext, and isSealed reports the thread state.
+func TestE2EAdapterSealUnseal(t *testing.T) {
+	_, s, start := setup(t)
+	a := start()
+	ownerKey, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	if _, err := e2eSetup(a.dir, base64.StdEncoding.EncodeToString(ownerKey.PublicKey().Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if a.e2e, err = loadSealer(a.dir); err != nil {
+		t.Fatal(err)
+	}
+	botPub := a.e2e.me.PublicKey()
+
+	// plain text is not sealed: unseal returns it as-is
+	plain, ok := a.unseal("hello there", "owner")
+	if !ok || plain != "hello there" {
+		t.Fatalf("plain text unsealed wrongly: %q %v", plain, ok)
+	}
+
+	// e2e3 sealed text from the owner opens
+	in, _ := e2eSeal("secret from owner", ownerKey, ownerKey.PublicKey(), botPub)
+	got, ok := a.unseal(in, "owner")
+	if !ok || got != "secret from owner" {
+		t.Fatalf("owner sealed did not open: %q %v", got, ok)
+	}
+
+	// POWER's own sealed text under her key opens as "bot"
+	own, _ := e2eSeal("bot speaking", a.e2e.me, botPub)
+	got, ok = a.unseal(own, "bot")
+	if !ok || got != "bot speaking" {
+		t.Fatalf("bot sealed did not open: %q %v", got, ok)
+	}
+
+	// sealed thread: unknown thread is not sealed
+	if sealed, err := a.isSealed("nope.1"); err != nil || sealed {
+		t.Fatalf("unknown thread sealed: %v %v", sealed, err)
+	}
+	// markSealed then isSealed reports sealed
+	if err := a.markSealed("300.1", "kana"); err != nil {
+		t.Fatal(err)
+	}
+	if sealed, err := a.isSealed("300.1"); err != nil || !sealed {
+		t.Fatalf("marked thread not sealed: %v %v", sealed, err)
+	}
+	if f := a.sealedForm("300.1"); f != "kana" {
+		t.Fatalf("sealed form = %q", f)
+	}
+
+	// a post into a sealed thread of the owner DM is sealed
+	ctx := context.Background()
+	if _, _, err := a.post(ctx, entry{ThreadTS: "300.1", Text: "in the sealed thread"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	p := s.of("chat.postMessage")
+	last := p[len(p)-1]
+	if !sealedText(last.Get("text")) {
+		t.Fatalf("post in sealed thread not ciphertext: %v", last.Get("text"))
+	}
+	if got, err := e2eOpen(last.Get("text"), ownerKey, botPub); err != nil || got != "in the sealed thread" {
+		t.Fatalf("sealed post did not open: %q %v", got, err)
+	}
+}
+
+// TestE2ESealPermissionError covers isSealed distinguishing ErrNotExist from
+// other stat errors: a permission error on the sealed-dir is logged and
+// returned rather than failing closed.
+func TestE2ESealPermissionError(t *testing.T) {
+	_, _, start := setup(t)
+	a := start()
+	if err := os.MkdirAll(a.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sealedDir := filepath.Join(a.dir, "e2e-sealed")
+	if err := os.Mkdir(sealedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sealedDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(sealedDir, 0o700)
+
+	// a stat error that is not ErrNotExist is returned (not treated as sealed)
+	if sealed, err := a.isSealed("400.1"); err == nil || sealed {
+		t.Fatalf("permission-error stat should fail open: sealed %v err %v", sealed, err)
+	}
+	// markSealed under a sealed dir reports the error
+	if err := a.markSealed("400.1", "kana"); err == nil {
+		t.Fatal("markSealed into unwritable dir should error")
 	}
 }

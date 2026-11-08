@@ -424,13 +424,22 @@ var threadTS = regexp.MustCompile(`^[0-9]{1,20}\.[0-9]{1,10}$`)
 // `power dm` (a script step) both add to it, so neither rewrites the other's state file.
 func (a *adapter) sealedPath(ts string) string { return filepath.Join(a.dir, "e2e-sealed", ts) }
 
-// isSealed fails closed: a mark it cannot check counts as sealed.
-func (a *adapter) isSealed(ts string) bool {
+// isSealed reports whether thread ts is sealed. ErrNotExist means not sealed;
+// any other stat error (permission, IO) is logged and returned so callers can
+// decide instead of failing closed.
+func (a *adapter) isSealed(ts string) (bool, error) {
 	if !threadTS.MatchString(ts) {
-		return false
+		return false, nil
 	}
 	_, err := os.Stat(a.sealedPath(ts))
-	return err == nil || !errors.Is(err, os.ErrNotExist)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		a.logErr(fmt.Errorf("e2e: stat sealed thread %s: %w", ts, err))
+		return false, err
+	}
+	return true, nil
 }
 
 func (a *adapter) markSealed(ts, form string) error {
@@ -543,7 +552,15 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, run, text string
 		kek, sealedKek = l.kekkai, a.e2e.kekkai[l.kekkai]
 	}
 	fresh := false // a sealed kekkai's run with no thread yet: this post opens a sealed one
-	if key == "" || !a.isSealed(key) {
+	sealed := false
+	if key == "" {
+		// no thread yet: sealed only if the kekkai itself demands it
+	} else if s, err := a.isSealed(key); err != nil {
+		return "", nil, false, err
+	} else {
+		sealed = s
+	}
+	if key == "" || !sealed {
 		switch {
 		case !sealedKek:
 			return text, blocks, false, nil
@@ -661,8 +678,10 @@ func (a *adapter) newRootForm(thread, run string) string {
 		run = a.run
 	}
 	if thread == "" && run != "" {
-		if l, err := a.runLink(run, 0); err == nil && l.thread != "" && a.isSealed(l.thread) {
-			return a.sealedForm(l.thread)
+		if l, err := a.runLink(run, 0); err == nil && l.thread != "" {
+			if sealed, e2 := a.isSealed(l.thread); e2 == nil && sealed {
+				return a.sealedForm(l.thread)
+			}
 		}
 	}
 	return "pair"
