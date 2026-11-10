@@ -206,7 +206,8 @@ func (a *adapter) status(ctx context.Context, ev kami.Event) {
 		return
 	}
 	l, err := a.runLink(ev.Run, 0)
-	if err != nil || l.thread == "" || (a.e2e != nil && a.isSealed(l.thread)) { // a sealed thread shows nothing in plaintext
+	// as sealOut: a sealed thread, or any thread of a sealed kekkai's run, shows nothing in plaintext
+	if err != nil || l.thread == "" || (a.e2e != nil && (a.isSealed(l.thread) || a.e2e.kekkai[l.kekkai])) {
 		a.logErr(err)
 		return
 	}
