@@ -403,6 +403,10 @@ func (a *adapter) threadRuns(key string) (string, error) {
 }
 
 func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
+	if ev.Type == "worker.started" || ev.Type == "worker.exited" {
+		a.status(ctx, ev)
+		return nil
+	}
 	if !followed(ev.Type) {
 		return nil
 	}

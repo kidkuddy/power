@@ -18,7 +18,9 @@ whatever you say to her goes back to Kami. The flows live in their own kekkais (
 - **Decisions as DMs.** Every Kami contract opens as a message to you: one button per answer
   for a choice, or a thread to reply in for an ask or a form. 🔒 contracts only take your press.
 - **One thread per run.** A run with a `thread_ts` lives in that Slack thread. Its decisions, its
-  `say` lines and a ✅/❌ when it finishes all go there, along with a live status card.
+  `say` lines and a ✅/❌ when it finishes all go there, along with a live status card (a Slack
+  plan: one task per milestone or child run, ✓ done / spinner / error). While a worker runs, the
+  thread shows "POWER is running <workflow> · <step>…". Sealed threads keep a text card and no status.
 - **Chats.** Any other DM from you goes to a chat run (`--chat-workflow`, default `chat`). Each
   thread is one conversation that keeps its Claude session.
 - **Coworkers.** A DM, channel or thread from anyone else goes to that conversation's session
