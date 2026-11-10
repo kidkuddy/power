@@ -485,6 +485,17 @@ func TestE2ESealKekkai(t *testing.T) {
 	k.runs["rwork"] = map[string]any{"id": "rwork", "workflow": "morning", "kekkai": "work", "vars": map[string]any{}}
 	k.mu.Unlock()
 
+	// a sealed kekkai's run in a plaintext thread shows no status line; another kekkai's run there does
+	k.mu.Lock()
+	k.runs["rls"] = map[string]any{"id": "rls", "workflow": "daily", "kekkai": "life", "vars": map[string]any{"thread_ts": "650.1"}}
+	k.runs["rws"] = map[string]any{"id": "rws", "workflow": "morning", "kekkai": "work", "vars": map[string]any{"thread_ts": "650.1"}}
+	k.mu.Unlock()
+	a.status(ctx, kami.Event{Type: "worker.started", Run: "rls", Data: map[string]any{"state": "secret"}})
+	a.status(ctx, kami.Event{Type: "worker.started", Run: "rws", Data: map[string]any{"state": "x"}})
+	if st := s.of("assistant.threads.setStatus"); len(st) != 1 || st[0].Get("status") != "is running morning · x…" {
+		t.Fatalf("status in sealed kekkai = %v", st)
+	}
+
 	// the cron run's first post (a script's `power dm`): a sealed new root, in pair form
 	a.run = "rlife"
 	_, root, err := a.post(ctx, entry{Text: "☀️ daily: the secret plan"}, nil)
