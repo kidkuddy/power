@@ -233,7 +233,7 @@ func (s *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "files.completeUploadExternal":
 		out = map[string]any{"files": []map[string]any{{"id": "FPIC", "title": "power.gif"}}}
-	case "canvases.edit", "canvases.access.set", "reactions.add", "pins.add", "pins.remove", "chat.delete":
+	case "canvases.edit", "canvases.access.set", "assistant.threads.setStatus", "reactions.add", "pins.add", "pins.remove", "chat.delete":
 		out = map[string]any{}
 	case "files.info":
 		out = map[string]any{"file": map[string]any{"id": r.Form.Get("file"), "permalink": "https://x.slack.com/docs/T1/" + r.Form.Get("file")}}
@@ -877,6 +877,24 @@ func TestRunThreads(t *testing.T) {
 	}
 	if p := s.of("pins.add"); len(p) != 0 {
 		t.Fatalf("cards are not pinned: %v", p)
+	}
+	// the card is a plan: rp's milestone done, the child that finished done, the failed root in the title
+	if b := ups[len(ups)-1].Get("blocks"); !strings.Contains(b, `"type":"plan","title":"POWER's status card · build `+"`rp`"+` · ❌ failed"`) ||
+		!strings.Contains(b, `"title":"↳ lint `+"`rc`"+`: ✅ lint: clean. POWER wins again!","status":"complete"`) {
+		t.Fatalf("plan = %s", b)
+	}
+	// a child still running is in progress, one that failed is an error
+	c := &card{Lines: []string{"a", "b", "c"}, Children: map[string]int{"r1": 1, "r2": 2}, Ended: map[string]bool{"r2": false}}
+	if r := c.rows(); r[0].status != slack.TaskCardStatusComplete || r[1].status != slack.TaskCardStatusInProgress || r[2].status != slack.TaskCardStatusError {
+		t.Fatalf("rows = %v", r)
+	}
+	// a worker in rc's tree shows under the thread while it runs, and clears when it exits
+	a.status(ctx, ev(0, "worker.started", "rc", map[string]any{"state": "lint", "worker": "w"}))
+	a.status(ctx, ev(0, "worker.exited", "rc", nil))
+	a.status(ctx, ev(0, "worker.started", "rn", map[string]any{"state": "x"})) // no thread: nothing
+	if st := s.of("assistant.threads.setStatus"); len(st) != 2 || st[0].Get("thread_ts") != "700.1" ||
+		st[0].Get("status") != "is running lint · lint…" || st[1].Get("status") != "" {
+		t.Fatalf("status = %v", st)
 	}
 	if th := a.st.Threads; th["c1"].Thread != "700.1" || th["c1"].TS != "100.1" || th["cN"].Thread != "" || th["c5"].Thread != "800.1" {
 		t.Fatalf("threads = %+v %+v %+v", th["c1"], th["cN"], th["c5"])
