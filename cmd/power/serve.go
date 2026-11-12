@@ -473,9 +473,6 @@ func (a *adapter) handle(ctx context.Context, ev kami.Event) error {
 		why, _ := ev.Data["error"].(string)
 		_, _, err := a.post(ctx, t.note("followup", id, "⚠ POWER's AFK helper gave up: "+why+"\nSo it's yours, human. Answer above or reply here."), nil)
 		return err
-	case "contract.grace_expired":
-		_, _, err := a.post(ctx, t.note("followup", id, "⏱ Too slow! Grace is over, POWER's AFK helper is answering now."), nil)
-		return err
 	}
 	return nil
 }
