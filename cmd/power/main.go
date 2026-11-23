@@ -72,6 +72,7 @@ func main() {
 	data := fs.String("data", "", "answer: form fields as a JSON object")
 	channel := fs.String("channel", "", "dm: post to this channel instead of the owner DM")
 	thread := fs.String("thread", "", "dm: post into this thread (its root message ts); log: only this thread")
+	seal := fs.Bool("seal", false, "dm: send sealed (e2e): a new post opens a sealed thread; in a plaintext thread only this message is sealed")
 	asJSON := fs.Bool("json", false, "thread, threads, log: JSON output")
 	follow := fs.Bool("f", false, "log: keep printing new entries")
 	run := fs.String("run", "", "log: only entries of this run")
@@ -146,6 +147,15 @@ func main() {
 	}
 	if a.e2e, err = loadSealer(dir); err != nil {
 		log.Fatalf("power: %v", err)
+	}
+	if *seal {
+		if cmd != "dm" {
+			log.Fatal("power: --seal is for dm only")
+		}
+		if a.e2e == nil {
+			log.Fatal("power dm --seal: no e2e keys (power e2e); refusing to send plaintext")
+		}
+		a.forceSeal = true
 	}
 	if cmd == "dm" && a.e2e != nil {
 		// an older serve may still be running and marking sealed threads in slack.json: move those marks
@@ -296,6 +306,7 @@ type adapter struct {
 	run                      string          // $KAMI_RUN of a script step's dm/canvas, for the transcript
 	links                    map[string]link // run id -> its thread, once known
 	e2e                      *sealer         // nil: no e2e.json, threads are never sealed
+	forceSeal                bool            // dm --seal: this post is sealed (a new root opens a sealed thread)
 }
 
 // --- Slack ---------------------------------------------------------------------
