@@ -279,6 +279,23 @@ func TestE2EThread(t *testing.T) {
 		t.Fatalf("after launch: %v", p[n-2:])
 	}
 
+	// `power dm --seal`: a new root opens a sealed thread; in a plaintext thread only that message
+	// is sealed (the thread stays plain); another channel is refused
+	a.forceSeal = true
+	_, sroot, err := a.post(ctx, entry{Text: "sealed by flag"}, nil)
+	a.post(ctx, entry{ThreadTS: "400.1", Text: "one sealed note"}, nil)
+	_, _, cerr := a.post(ctx, entry{Channel: "C9", Text: "to a channel"}, nil)
+	a.forceSeal = false
+	p = s.of("chat.postMessage")
+	if n := len(p); err != nil || cerr == nil || !sealedText(p[n-2].Get("text")) || !a.isSealed(sroot) ||
+		!sealedText(p[n-1].Get("text")) || a.isSealed("400.1") {
+		t.Fatalf("--seal: %v %v %v sealed root %v plain thread %v", err, cerr, p[n-2:], a.isSealed(sroot), a.isSealed("400.1"))
+	}
+	nb2, _ := e2eDecode(p[len(p)-1].Get("text"))
+	if pt, _, _, err := e2ePairOpen(nb2, a.e2e.me, ownerKey.PublicKey()); err != nil || pt != "one sealed note" {
+		t.Fatalf("owner reads %q %v", pt, err)
+	}
+
 	// the thread's history reaches the chat decrypted
 	s.mu.Lock()
 	s.replies["300.1"] = []map[string]any{{"ts": "300.1", "user": owner, "text": in}, {"ts": "300.2", "bot_id": "B1", "text": last.Get("text")}}

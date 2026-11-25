@@ -542,26 +542,30 @@ func (a *adapter) sealOut(ctx context.Context, channel, thread, run, text string
 		}
 		kek, sealedKek = l.kekkai, a.e2e.kekkai[l.kekkai]
 	}
-	fresh := false // a sealed kekkai's run with no thread yet: this post opens a sealed one
+	fresh := false  // a sealed kekkai's run with no thread yet: this post opens a sealed one
+	single := false // dm --seal into a plaintext thread: this message is sealed, the thread stays as it is
 	if key == "" || !a.isSealed(key) {
 		switch {
+		case a.forceSeal && key == "":
+		case a.forceSeal:
+			single = true
 		case !sealedKek:
 			return text, blocks, false, nil
 		case key != "":
 			return "", nil, false, fmt.Errorf("e2e: run %s of sealed kekkai %s posts into plaintext thread %s: refused", run, kek, key)
 		}
-		fresh = true
+		fresh = !single
 	}
 	if im, err := a.dm(ctx); err != nil {
 		return "", nil, false, err
 	} else if channel != "" && channel != im {
-		if sealedKek {
+		if sealedKek || a.forceSeal {
 			return "", nil, false, fmt.Errorf("e2e: run %s of sealed kekkai %s posts to channel %s: only the owner DM is sealed, refused", run, kek, channel)
 		}
 		return text, blocks, false, nil // the key is the owner DM's thread ts; another channel's thread is not sealed
 	}
 	form := "pair"
-	if !fresh {
+	if !fresh && !single {
 		form = a.sealedForm(key)
 	}
 	seal := func(s string) (string, error) {
